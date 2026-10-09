@@ -44,16 +44,6 @@ static UIViewController *topViewController() {
     return topVC;
 }
 
-static UIViewController *findMessageDetailController(UIViewController *vc) {
-    if ([vc isKindOfClass:NSClassFromString(@"MessageDetailController")]) return vc;
-    for (UIViewController *child in vc.childViewControllers) {
-        UIViewController *found = findMessageDetailController(child);
-        if (found) return found;
-    }
-    if (vc.presentedViewController) return findMessageDetailController(vc.presentedViewController);
-    return nil;
-}
-
 // ===================== 音频播放器 =====================
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
@@ -61,9 +51,10 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== Hook CWRecorder 替换录音路径 =====================
+// ===================== 全局变量，用于替换录音路径 =====================
 static NSString *g_voicePathToSend = nil;
 
+// 1. Hook 日志里的 CWRecorder 替换录音路径
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
@@ -73,61 +64,10 @@ static NSString *g_voicePathToSend = nil;
 }
 %end
 
-// ===================== 发送逻辑 =====================
-static void sendVoiceWithPath(NSString *sourcePath) {
-    stopPlayingAudio();
-    
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"错误" message:@"音频文件不存在" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        [topViewController() presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-
-    UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"请先进入聊天界面" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        [topViewController() presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-
-    // 唯一文件名，避免冲突
-    NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
-    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
-
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
-    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-    session.outputURL = [NSURL fileURLWithPath:outputPath];
-    session.outputFileType = AVFileTypeAppleM4A;
-
-    [session exportAsynchronouslyWithCompletionHandler:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSDictionary *outAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-            if (session.status != AVAssetExportSessionStatusCompleted || !outAttrs || [outAttrs fileSize] == 0) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"转码失败" message:@"音频无法转换，请换个文件" preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-                [topViewController() presentViewController:alert animated:YES completion:nil];
-                return;
-            }
-
-            g_voicePathToSend = outputPath;
-
-            SEL sendSel = NSSelectorFromString(@"sendSound");
-            if ([chatVC respondsToSelector:sendSel]) {
-                NSMethodSignature *sig = [chatVC methodSignatureForSelector:sendSel];
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv setTarget:chatVC];
-                [inv setSelector:sendSel];
-                [inv invoke];
-            }
-        });
-    }];
-}
-
-// ===================== 语音列表控制器 =====================
+// ===================== 语音列表控制器（原生UITableViewController） =====================
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
+@property (nonatomic, assign) UIViewController *chatVC; // 记录发起的聊天界面
 @end
 
 @implementation VoicePackListVC
@@ -142,7 +82,7 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(close)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"新建分类" style:UIBarButtonItemStylePlain target:self action:@selector(createCategory)];
     
-    // 底部三个按钮
+    // 底部原生工具栏
     self.navigationController.toolbarHidden = NO;
     UIBarButtonItem *videoBtn = [[UIBarButtonItem alloc] initWithTitle:@"视频转语音" style:UIBarButtonItemStylePlain target:self action:@selector(videoAction)];
     UIBarButtonItem *linkBtn = [[UIBarButtonItem alloc] initWithTitle:@"链接转语音" style:UIBarButtonItemStylePlain target:self action:@selector(linkAction)];
@@ -184,7 +124,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 表格数据源
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return self.files.count;
 }
@@ -199,24 +138,23 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     double size = [attrs fileSize] / 1024.0;
     cell.detailTextLabel.text = [NSString stringWithFormat:@"%.2f KB", size];
     
-    // 左侧播放按钮
+    UIView *rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 40)];
+    
     UIButton *playBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    playBtn.frame = CGRectMake(0, 5, 40, 30);
     [playBtn setImage:[UIImage systemImageNamed:@"play.circle.fill"] forState:UIControlStateNormal];
-    playBtn.frame = CGRectMake(0, 0, 36, 36);
     playBtn.tag = indexPath.row;
     [playBtn addTarget:self action:@selector(playAction:) forControlEvents:UIControlEventTouchUpInside];
-    cell.accessoryView = playBtn;
+    [rightView addSubview:playBtn];
     
-    // 右侧发送按钮（用自定义 view）
-    UIView *rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 40)];
     UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    sendBtn.frame = CGRectMake(0, 0, 80, 40);
+    sendBtn.frame = CGRectMake(50, 5, 50, 30);
     [sendBtn setTitle:@"发送" forState:UIControlStateNormal];
     sendBtn.tag = indexPath.row;
     [sendBtn addTarget:self action:@selector(sendAction:) forControlEvents:UIControlEventTouchUpInside];
     [rightView addSubview:sendBtn];
-    cell.accessoryView = rightView;
     
+    cell.accessoryView = rightView;
     return cell;
 }
 
@@ -232,12 +170,40 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 - (void)sendAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+    
+    // 关闭列表，把文件路径交给 App 自己的发送逻辑
     [self dismissViewControllerAnimated:YES completion:^{
-        sendVoiceWithPath(path);
+        // 转码为 M4A
+        NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
+        NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
+        
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+        AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+        session.outputURL = [NSURL fileURLWithPath:outputPath];
+        session.outputFileType = AVFileTypeAppleM4A;
+        
+        [session exportAsynchronouslyWithCompletionHandler:^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // 设置全局替换路径
+                g_voicePathToSend = outputPath;
+                
+                // 调用日志里明明白白写着的 sendSound 方法
+                if (self.chatVC && [self.chatVC respondsToSelector:NSSelectorFromString(@"sendSound")]) {
+                    SEL sendSel = NSSelectorFromString(@"sendSound");
+                    NSMethodSignature *sendSig = [self.chatVC methodSignatureForSelector:sendSel];
+                    NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+                    [sendInv setTarget:self.chatVC];
+                    [sendInv setSelector:sendSel];
+                    [sendInv invoke];
+                    NSLog(@"[VoicePlugin] 已调用原生 sendSound");
+                } else {
+                    NSLog(@"[VoicePlugin] chatVC 为空或无法响应 sendSound");
+                }
+            });
+        }];
     }];
 }
 
-// PHPicker 视频选择
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -266,10 +232,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
                     if (session.status == AVAssetExportSessionStatusCompleted) {
                         self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
                         [self.tableView reloadData];
-                    } else {
-                        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"转换失败" message:@"视频提取音频失败" preferredStyle:UIAlertControllerStyleAlert];
-                        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                        [self presentViewController:a animated:YES completion:nil];
                     }
                 });
             }];
@@ -277,22 +239,14 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     }
 }
 
-// 文件导入
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
     NSURL *url = urls.firstObject;
-    
     NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:url.lastPathComponent];
     [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
-    
     NSError *error;
     [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:destPath error:&error];
-    
-    if (error) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"导入失败" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-    } else {
+    if (!error) {
         self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
         [self.tableView reloadData];
     }
@@ -300,62 +254,21 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 
 @end
 
-// ===================== 悬浮球 =====================
-static UIWindow *floatWindow;
-static UIButton *floatButton;
-static id floatHandler;
+// ===================== 核心：根据日志，Hook 录音按钮 =====================
+%hook MessageDetailController
 
-@interface FloatHandler : NSObject
-@end
-
-@implementation FloatHandler
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIView *btn = gesture.view;
-    CGPoint translation = [gesture translationInView:btn.superview];
-    btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:btn.superview];
-}
-- (void)handleTap {
+// 日志中明确写了这个方法，点击麦克风时会触发
+- (void)recordSound {
+    // 不调用 %orig，彻底阻止 App 启动原生录音
+    NSLog(@"[VoicePlugin] 拦截到 recordSound，弹出语音列表");
+    
     VoicePackListVC *listVC = [[VoicePackListVC alloc] init];
+    listVC.chatVC = self; // 把当前的聊天控制器传给列表
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
+    
+    // 使用系统原生底部弹窗
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [topViewController() presentViewController:nav animated:YES completion:nil];
-}
-@end
-
-static void createFloatUI() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindowScene *windowScene = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-                windowScene = (UIWindowScene *)scene; break;
-            }
-        }
-        if (!windowScene) return;
-        floatWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
-        floatWindow.frame = CGRectMake(150, 300, 60, 60);
-        floatWindow.windowLevel = UIWindowLevelAlert + 100;
-        floatWindow.backgroundColor = [UIColor clearColor];
-        floatWindow.rootViewController = [UIViewController new];
-        floatWindow.hidden = NO;
-
-        floatHandler = [FloatHandler new];
-        floatButton = [UIButton buttonWithType:UIButtonTypeCustom];
-        floatButton.frame = CGRectMake(0, 0, 60, 60);
-        floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
-        floatButton.layer.cornerRadius = 30;
-        [floatButton setTitle:@"语音" forState:UIControlStateNormal];
-        floatButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        [floatButton addTarget:floatHandler action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:floatHandler action:@selector(handlePan:)];
-        [floatButton addGestureRecognizer:pan];
-        [floatWindow.rootViewController.view addSubview:floatButton];
-    });
+    [self presentViewController:nav animated:YES completion:nil];
 }
 
-__attribute__((constructor)) static void init() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        createFloatUI();
-    });
-}
+%end
