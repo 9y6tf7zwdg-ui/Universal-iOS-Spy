@@ -32,22 +32,6 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     return voiceFiles;
 }
 
-// ===================== 顶层控制器 =====================
-static UIViewController *topViewController() {
-    UIWindow *keyWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (window.isKeyWindow) { keyWindow = window; break; }
-            }
-        }
-    }
-    if (!keyWindow) return nil;
-    UIViewController *topVC = keyWindow.rootViewController;
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-    return topVC;
-}
-
 // ===================== 音频播放器 =====================
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
