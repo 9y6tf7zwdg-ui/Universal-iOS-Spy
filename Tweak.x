@@ -8,6 +8,10 @@
 - (void)sendSound;
 @end
 
+@interface CWTalkBackView : UIView
+- (void)sendRecorde:(id)sender;
+@end
+
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @property (nonatomic, copy) void (^onSelect)(NSString *path);
@@ -144,7 +148,6 @@ static BOOL g_skipIntercept = NO;
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     stopPlayingAudio();
-    
     NSString *selectedPath = nil;
     if (indexPath.row > 0) {
         NSString *fileName = self.files[indexPath.row - 1];
@@ -199,41 +202,69 @@ static BOOL g_skipIntercept = NO;
 
 @end
 
-// ===================== 核心：Hook sendSound，弹出列表 =====================
-%hook MessageDetailController
+// ===================== 核心拦截：多个入口同时 Hook =====================
 
-- (void)sendSound {
-    // 二次调用：直接放行，让 App 走原流程
+// 入口 1：预览界面点击"发送"按钮（日志里 CWTalkBackView 有 sendRecorde: 方法）
+%hook CWTalkBackView
+
+- (void)sendRecorde:(id)sender {
     if (g_skipIntercept) {
         g_skipIntercept = NO;
-        NSLog(@"[VoicePlugin] 二次进入 sendSound，放行");
+        g_voicePathToSend = nil;  // 让原生流程用真实路径
         %orig;
         return;
     }
     
+    NSLog(@"[VoicePlugin] 拦截 CWTalkBackView sendRecorde，弹出语音列表");
+    
+    VoicePackListVC *vc = [[VoicePackListVC alloc] init];
+    __weak typeof(self) weakSelf = self;
+    
+    vc.onSelect = ^(NSString *path) {
+        if (path) g_voicePathToSend = path;
+        g_skipIntercept = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf sendRecorde:sender];
+        });
+    };
+    
+    vc.onCancel = ^{
+        g_voicePathToSend = nil;
+        g_skipIntercept = NO;
+        NSLog(@"[VoicePlugin] 用户取消发送");
+    };
+    
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [topViewController() presentViewController:nav animated:YES completion:nil];
+}
+
+%end
+
+// 入口 2：备用，日志里的 sendSound
+%hook MessageDetailController
+
+- (void)sendSound {
+    if (g_skipIntercept) {
+        g_skipIntercept = NO;
+        %orig;
+        return;
+    }
     NSLog(@"[VoicePlugin] 拦截 sendSound，弹出语音列表");
     
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     __weak typeof(self) weakSelf = self;
     
     vc.onSelect = ^(NSString *path) {
-        if (path) {
-            g_voicePathToSend = path;
-            NSLog(@"[VoicePlugin] 用户选择替换: %@", path);
-        } else {
-            g_voicePathToSend = nil;
-            NSLog(@"[VoicePlugin] 用户选择使用原录音");
-        }
+        if (path) g_voicePathToSend = path;
         g_skipIntercept = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [weakSelf sendSound];
         });
     };
-    
     vc.onCancel = ^{
-        NSLog(@"[VoicePlugin] 用户取消发送");
         g_voicePathToSend = nil;
-        g_skipIntercept = YES;
+        g_skipIntercept = NO;
     };
     
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
@@ -247,7 +278,7 @@ static BOOL g_skipIntercept = NO;
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
-        NSLog(@"[VoicePlugin] CWRecorder.recordPath 返回替换路径: %@", g_voicePathToSend);
+        NSLog(@"[VoicePlugin] 替换录音路径: %@", g_voicePathToSend);
         return g_voicePathToSend;
     }
     return %orig;
