@@ -2,9 +2,9 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <PhotosUI/PhotosUI.h>
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // 🚨 引入新框架解决废弃API报错
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 基础工具函数 =====================
+// ===================== 工具函数 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -53,21 +53,22 @@ static UIViewController *findMessageDetailController(UIViewController *vc) {
     return nil;
 }
 
-// 停止当前正在播放的音频
+// 全局音频播放器，用于试听
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) {
         [sharedAudioPlayer stop];
-        sharedAudioPlayer = nil;
     }
+    sharedAudioPlayer = nil;
 }
 
-// ===================== 核心发送逻辑（移花接木，彻底解决灰色方块） =====================
+// ===================== 核心发送逻辑：移花接木 =====================
 static void sendVoiceWithPath(NSString *sourcePath) {
     stopPlayingAudio();
     
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"错误" message:@"音频文件不存在。" preferredStyle:UIAlertControllerStyleAlert];
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:sourcePath error:nil];
+    if (!attrs || [attrs fileSize] == 0) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"音频文件为空或不存在。" preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [topViewController() presentViewController:alert animated:YES completion:nil];
         return;
@@ -75,7 +76,7 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     
     UIViewController *chatVC = findMessageDetailController(topViewController());
     if (!chatVC) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"请先进入任意聊天界面，再点击发送！" preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"请先进入聊天" message:@"请先进入任意一个聊天界面，再点击发送。" preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [topViewController() presentViewController:alert animated:YES completion:nil];
         return;
@@ -91,15 +92,14 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     
     [session exportAsynchronouslyWithCompletionHandler:^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-            if (session.status != AVAssetExportSessionStatusCompleted || !attrs || [attrs fileSize] == 0) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"音频转码失败或文件为空。" preferredStyle:UIAlertControllerStyleAlert];
+            NSDictionary *outAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
+            if (session.status != AVAssetExportSessionStatusCompleted || !outAttrs || [outAttrs fileSize] == 0) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"转码失败" message:@"音频无法转换，请换个文件试试。" preferredStyle:UIAlertControllerStyleAlert];
                 [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
                 [topViewController() presentViewController:alert animated:YES completion:nil];
                 return;
             }
             
-            // 1. 尝试寻找 App 底层的录音器，使用最稳妥的“移花接木”方案
             id recorder = nil;
             @try { recorder = [chatVC valueForKey:@"recorder"]; } @catch (NSException *e) {}
             if (!recorder) {
@@ -111,7 +111,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
             }
             
             if (recorder && [recorder respondsToSelector:NSSelectorFromString(@"beginRecordWithRecordPath:")]) {
-                NSLog(@"[VoicePlugin] 找到原生录音器，接管发送流程...");
                 SEL beginSel = NSSelectorFromString(@"beginRecordWithRecordPath:");
                 NSMethodSignature *beginSig = [recorder methodSignatureForSelector:beginSel];
                 NSInvocation *beginInv = [NSInvocation invocationWithMethodSignature:beginSig];
@@ -128,52 +127,27 @@ static void sendVoiceWithPath(NSString *sourcePath) {
                     [endInv setTarget:recorder];
                     [endInv setSelector:endSel];
                     [endInv invoke];
-                    NSLog(@"[VoicePlugin] 已触发原生管线发送！");
                 }
             } else {
-                // 2. 备用方案：直接调用底层 V2TIM API
-                NSLog(@"[VoicePlugin] 未找到录音器，尝试直接调用 V2TIM API...");
-                Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
-                id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
-                SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-                if ([manager respondsToSelector:createSel]) {
-                    NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    [inv setTarget:manager];
-                    [inv setSelector:createSel];
-                    __unsafe_unretained NSString *pathArg = outputPath;
-                    [inv setArgument:&pathArg atIndex:2];
-                    int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
-                    [inv setArgument:&duration atIndex:3];
-                    [inv invoke];
-                    
-                    __unsafe_unretained id msg = nil;
-                    [inv getReturnValue:&msg];
-                    
-                    SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-                    if ([chatVC respondsToSelector:sendSel]) {
-                        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-                        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-                        [sendInv setTarget:chatVC];
-                        [sendInv setSelector:sendSel];
-                        [sendInv setArgument:&msg atIndex:2];
-                        BOOL retry = NO;
-                        [sendInv setArgument:&retry atIndex:3];
-                        [sendInv invoke];
-                    }
+                SEL sendSel = NSSelectorFromString(@"sendSound");
+                if ([chatVC respondsToSelector:sendSel]) {
+                    NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+                    NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+                    [sendInv setTarget:chatVC];
+                    [sendInv setSelector:sendSel];
+                    [sendInv invoke];
                 }
             }
         });
     }];
 }
 
-// ===================== 语音列表 Cell (带试听) =====================
+// ===================== 语音列表 Cell =====================
 @interface VoicePackCell : UITableViewCell
 @property (nonatomic, strong) UIButton *playButton;
 @property (nonatomic, strong) UILabel *nameLabel;
 @property (nonatomic, strong) UILabel *sizeLabel;
 @property (nonatomic, strong) UIButton *sendButton;
-@property (nonatomic, strong) NSString *filePath;
 @end
 
 @implementation VoicePackCell
@@ -227,12 +201,10 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 }
 @end
 
-// ===================== 语音包管理主界面 =====================
-@interface VoicePackManagerViewController : UIViewController <UITableViewDelegate, UITableViewDataSource, UISearchBarDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+// ===================== 语音包管理界面 =====================
+@interface VoicePackManagerViewController : UIViewController <UITableViewDelegate, UITableViewDataSource, PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableArray<NSString *> *voiceFiles;
-@property (nonatomic, strong) NSMutableArray<NSString *> *filteredFiles;
-@property (nonatomic, strong) UISearchBar *searchBar;
 @end
 
 @implementation VoicePackManagerViewController
@@ -245,19 +217,13 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(close)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"新建分类" style:UIBarButtonItemStylePlain target:self action:@selector(createCategory)];
     
-    self.searchBar = [[UISearchBar alloc] init];
-    self.searchBar.placeholder = @"搜索语音包";
-    self.searchBar.delegate = self;
-    
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
     self.tableView.rowHeight = 70;
-    self.tableView.tableHeaderView = self.searchBar;
     [self.tableView registerClass:[VoicePackCell class] forCellReuseIdentifier:@"VoicePackCell"];
     [self.view addSubview:self.tableView];
     
-    // 底部工具栏
     UIView *bottomView = [[UIView alloc] initWithFrame:CGRectMake(0, self.view.bounds.size.height - 80, self.view.bounds.size.width, 80)];
     bottomView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     bottomView.autoresizingMask = UIViewAutoresizingFlexibleTopMargin;
@@ -280,13 +246,12 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 
 - (void)reloadData {
     self.voiceFiles = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-    self.filteredFiles = [NSMutableArray arrayWithArray:self.voiceFiles];
     [self.tableView reloadData];
 }
 
-- (void)close { 
+- (void)close {
     stopPlayingAudio();
-    [self dismissViewControllerAnimated:YES completion:nil]; 
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)createCategory {
@@ -296,39 +261,37 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 }
 
 - (void)bottomAction:(UIButton *)sender {
-    if (sender.tag == 0) { // 视频转语音
+    if (sender.tag == 0) {
         PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
         config.filter = PHPickerFilter.videosFilter;
         config.selectionLimit = 1;
         PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
         picker.delegate = self;
         [self presentViewController:picker animated:YES completion:nil];
-    } else if (sender.tag == 1) { // 链接转语音
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"链接转语音" message:@"该功能需要后端接口支持，暂未开放。" preferredStyle:UIAlertControllerStyleAlert];
+    } else if (sender.tag == 1) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"链接转语音" message:@"该功能需要后台接口支持，暂未开放。" preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
-    } else { // 导入语音包 🚨 替换为最新的 iOS 14+ API
+    } else {
         UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
         picker.delegate = self;
         [self presentViewController:picker animated:YES completion:nil];
     }
 }
 
-// 表格代理
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.filteredFiles.count;
+    return self.voiceFiles.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     VoicePackCell *cell = [tableView dequeueReusableCellWithIdentifier:@"VoicePackCell" forIndexPath:indexPath];
-    NSString *fileName = self.filteredFiles[indexPath.row];
+    NSString *fileName = self.voiceFiles[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     
     cell.nameLabel.text = fileName;
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:fullPath error:nil];
     double size = [attrs fileSize] / 1024.0;
     cell.sizeLabel.text = [NSString stringWithFormat:@"文件大小 %.2f KB", size];
-    cell.filePath = fullPath;
     
     cell.playButton.tag = indexPath.row;
     cell.sendButton.tag = indexPath.row;
@@ -342,7 +305,7 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 }
 
 - (void)playVoice:(UIButton *)sender {
-    NSString *fileName = self.filteredFiles[sender.tag];
+    NSString *fileName = self.voiceFiles[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     stopPlayingAudio();
     NSError *error;
@@ -353,26 +316,13 @@ static void sendVoiceWithPath(NSString *sourcePath) {
 }
 
 - (void)sendVoice:(UIButton *)sender {
-    NSString *fileName = self.filteredFiles[sender.tag];
+    NSString *fileName = self.voiceFiles[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     [self dismissViewControllerAnimated:YES completion:^{
         sendVoiceWithPath(path);
     }];
 }
 
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    if (searchText.length == 0) {
-        self.filteredFiles = [NSMutableArray arrayWithArray:self.voiceFiles];
-    } else {
-        self.filteredFiles = [NSMutableArray array];
-        for (NSString *file in self.voiceFiles) {
-            if ([file.lowercaseString containsString:searchText.lowercaseString]) [self.filteredFiles addObject:file];
-        }
-    }
-    [self.tableView reloadData];
-}
-
-// 相册视频转语音
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -381,10 +331,17 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
             if (error || !url) return;
+            
+            NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
+            [fm copyItemAtPath:url.path toPath:tempPath error:&error];
+            if (error) return;
+            
             NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
             
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tempPath] options:nil];
             AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
             session.outputURL = [NSURL fileURLWithPath:destPath];
             session.outputFileType = AVFileTypeAppleM4A;
@@ -404,7 +361,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     }
 }
 
-// 文件导入
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
     NSURL *url = urls.firstObject;
@@ -444,6 +400,16 @@ static id floatHandler;
 - (void)handleTap {
     VoicePackManagerViewController *vc = [[VoicePackManagerViewController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        if (sheet) {
+            sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+            sheet.prefersGrabberVisible = YES;
+        }
+    }
+    
     [topViewController() presentViewController:nav animated:YES completion:nil];
 }
 @end
