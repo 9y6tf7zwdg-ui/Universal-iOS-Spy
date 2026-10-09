@@ -12,8 +12,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Theos
+      - name: Install Theos and ldid
         run: |
+          # 安装 ldid 签名工具（修复报错的核心）
+          brew install ldid
+          
+          # 安装 Theos
           export THEOS=/opt/theos
           sudo git clone --recursive https://github.com/theos/theos.git $THEOS
           sudo chown -R $(id -u):$(id -g) $THEOS
