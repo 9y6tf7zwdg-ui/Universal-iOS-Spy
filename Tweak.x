@@ -2,8 +2,9 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 #import <PhotosUI/PhotosUI.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // 🚨 引入新框架解决废弃API报错
 
-// ===================== 基础路径工具 =====================
+// ===================== 基础工具函数 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -52,7 +53,7 @@ static UIViewController *findMessageDetailController(UIViewController *vc) {
     return nil;
 }
 
-// 停止当前正在播放的音频，避免多个音频同时播放
+// 停止当前正在播放的音频
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) {
@@ -61,9 +62,9 @@ static void stopPlayingAudio() {
     }
 }
 
-// ===================== 核心发送逻辑 =====================
+// ===================== 核心发送逻辑（移花接木，彻底解决灰色方块） =====================
 static void sendVoiceWithPath(NSString *sourcePath) {
-    stopPlayingAudio(); // 发送前先停止试听
+    stopPlayingAudio();
     
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"错误" message:@"音频文件不存在。" preferredStyle:UIAlertControllerStyleAlert];
@@ -98,37 +99,68 @@ static void sendVoiceWithPath(NSString *sourcePath) {
                 return;
             }
             
-            int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
-            if (duration <= 0) duration = 1;
+            // 1. 尝试寻找 App 底层的录音器，使用最稳妥的“移花接木”方案
+            id recorder = nil;
+            @try { recorder = [chatVC valueForKey:@"recorder"]; } @catch (NSException *e) {}
+            if (!recorder) {
+                for (UIView *sub in chatVC.view.subviews) {
+                    if ([sub isKindOfClass:NSClassFromString(@"CWRecordView")] || [sub isKindOfClass:NSClassFromString(@"CWTalkBackView")]) {
+                        recorder = sub; break;
+                    }
+                }
+            }
             
-            Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
-            id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
-            SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-            
-            if ([manager respondsToSelector:createSel]) {
-                NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv setTarget:manager];
-                [inv setSelector:createSel];
+            if (recorder && [recorder respondsToSelector:NSSelectorFromString(@"beginRecordWithRecordPath:")]) {
+                NSLog(@"[VoicePlugin] 找到原生录音器，接管发送流程...");
+                SEL beginSel = NSSelectorFromString(@"beginRecordWithRecordPath:");
+                NSMethodSignature *beginSig = [recorder methodSignatureForSelector:beginSel];
+                NSInvocation *beginInv = [NSInvocation invocationWithMethodSignature:beginSig];
+                [beginInv setTarget:recorder];
+                [beginInv setSelector:beginSel];
                 __unsafe_unretained NSString *pathArg = outputPath;
-                [inv setArgument:&pathArg atIndex:2];
-                [inv setArgument:&duration atIndex:3];
-                [inv invoke];
+                [beginInv setArgument:&pathArg atIndex:2];
+                [beginInv invoke];
                 
-                __unsafe_unretained id msg = nil;
-                [inv getReturnValue:&msg];
-                
-                SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-                if ([chatVC respondsToSelector:sendSel]) {
-                    NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-                    NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-                    [sendInv setTarget:chatVC];
-                    [sendInv setSelector:sendSel];
-                    [sendInv setArgument:&msg atIndex:2];
-                    BOOL retry = NO;
-                    [sendInv setArgument:&retry atIndex:3];
-                    [sendInv invoke];
-                    NSLog(@"[VoicePlugin] 语音已触发发送！");
+                if ([recorder respondsToSelector:NSSelectorFromString(@"endRecord")]) {
+                    SEL endSel = NSSelectorFromString(@"endRecord");
+                    NSMethodSignature *endSig = [recorder methodSignatureForSelector:endSel];
+                    NSInvocation *endInv = [NSInvocation invocationWithMethodSignature:endSig];
+                    [endInv setTarget:recorder];
+                    [endInv setSelector:endSel];
+                    [endInv invoke];
+                    NSLog(@"[VoicePlugin] 已触发原生管线发送！");
+                }
+            } else {
+                // 2. 备用方案：直接调用底层 V2TIM API
+                NSLog(@"[VoicePlugin] 未找到录音器，尝试直接调用 V2TIM API...");
+                Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
+                id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
+                SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+                if ([manager respondsToSelector:createSel]) {
+                    NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setTarget:manager];
+                    [inv setSelector:createSel];
+                    __unsafe_unretained NSString *pathArg = outputPath;
+                    [inv setArgument:&pathArg atIndex:2];
+                    int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+                    [inv setArgument:&duration atIndex:3];
+                    [inv invoke];
+                    
+                    __unsafe_unretained id msg = nil;
+                    [inv getReturnValue:&msg];
+                    
+                    SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
+                    if ([chatVC respondsToSelector:sendSel]) {
+                        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+                        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+                        [sendInv setTarget:chatVC];
+                        [sendInv setSelector:sendSel];
+                        [sendInv setArgument:&msg atIndex:2];
+                        BOOL retry = NO;
+                        [sendInv setArgument:&retry atIndex:3];
+                        [sendInv invoke];
+                    }
                 }
             }
         });
@@ -171,7 +203,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
         [_sendButton setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
         [self.contentView addSubview:_sendButton];
         
-        // 布局约束
         _playButton.translatesAutoresizingMaskIntoConstraints = NO;
         _nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
         _sizeLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -182,14 +213,11 @@ static void sendVoiceWithPath(NSString *sourcePath) {
             [_playButton.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
             [_playButton.widthAnchor constraintEqualToConstant:36],
             [_playButton.heightAnchor constraintEqualToConstant:36],
-            
             [_nameLabel.leadingAnchor constraintEqualToAnchor:_playButton.trailingAnchor constant:10],
             [_nameLabel.trailingAnchor constraintEqualToAnchor:_sendButton.leadingAnchor constant:-10],
             [_nameLabel.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:10],
-            
             [_sizeLabel.leadingAnchor constraintEqualToAnchor:_nameLabel.leadingAnchor],
             [_sizeLabel.topAnchor constraintEqualToAnchor:_nameLabel.bottomAnchor constant:4],
-            
             [_sendButton.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-15],
             [_sendButton.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
             [_sendButton.widthAnchor constraintEqualToConstant:50],
@@ -279,8 +307,8 @@ static void sendVoiceWithPath(NSString *sourcePath) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"链接转语音" message:@"该功能需要后端接口支持，暂未开放。" preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
-    } else { // 导入语音包
-        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"] inMode:UIDocumentPickerModeImport];
+    } else { // 导入语音包 🚨 替换为最新的 iOS 14+ API
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
         picker.delegate = self;
         [self presentViewController:picker animated:YES completion:nil];
     }
@@ -313,11 +341,9 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     return cell;
 }
 
-// 试听
 - (void)playVoice:(UIButton *)sender {
     NSString *fileName = self.filteredFiles[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
-    
     stopPlayingAudio();
     NSError *error;
     sharedAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:&error];
@@ -326,7 +352,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     }
 }
 
-// 发送
 - (void)sendVoice:(UIButton *)sender {
     NSString *fileName = self.filteredFiles[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
@@ -335,7 +360,6 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     }];
 }
 
-// 搜索
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
     if (searchText.length == 0) {
         self.filteredFiles = [NSMutableArray arrayWithArray:self.voiceFiles];
@@ -348,7 +372,7 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     [self.tableView reloadData];
 }
 
-// 从相册选择视频并提取音频
+// 相册视频转语音
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -380,7 +404,7 @@ static void sendVoiceWithPath(NSString *sourcePath) {
     }
 }
 
-// 从文件 App 导入音频
+// 文件导入
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
     NSURL *url = urls.firstObject;
