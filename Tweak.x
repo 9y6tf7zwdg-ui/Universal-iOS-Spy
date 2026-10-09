@@ -4,7 +4,6 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 1. 声明必要的类 =====================
 @interface MessageDetailController : UIViewController
 @end
 
@@ -12,7 +11,6 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
 
-// ===================== 2. 沙盒路径 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -36,7 +34,6 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     return voiceFiles;
 }
 
-// ===================== 3. 顶层控制器查找 =====================
 static UIViewController *topViewController() {
     UIWindow *keyWindow = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -62,26 +59,15 @@ static UIViewController *findMessageDetailController(UIViewController *vc) {
     return nil;
 }
 
-// ===================== 4. 音频播放器 =====================
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) [sharedAudioPlayer stop];
     sharedAudioPlayer = nil;
 }
 
-// ===================== 5. 全局变量（强引用，防止被释放） =====================
-static UIViewController *g_chatVC = nil;
-static NSString *g_voicePathToSend = nil;
-static int g_voiceDurationToSend = 0;
-
-// ===================== 6. 核心弹窗函数 =====================
 static void showVoiceList() {
     UIViewController *topVC = topViewController();
     if (!topVC) return;
-    
-    g_chatVC = findMessageDetailController(topVC);
-    if (!g_chatVC) g_chatVC = topVC;
-    
     if ([topVC isKindOfClass:NSClassFromString(@"VoicePackListVC")]) return;
     
     VoicePackListVC *listVC = [[VoicePackListVC alloc] init];
@@ -90,51 +76,24 @@ static void showVoiceList() {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-// ===================== 7. 拦截底层录音路径与时长 =====================
+// ===================== 拦截录音入口 =====================
 %hook CWRecorder
-- (NSString *)recordPath {
-    if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
-        return g_voicePathToSend;
-    }
-    return %orig;
-}
-
-- (int)recordDuration {
-    if (g_voicePathToSend && g_voiceDurationToSend > 0) {
-        return g_voiceDurationToSend;
-    }
-    return %orig;
-}
-
-- (BOOL)isRecording {
-    if (g_voicePathToSend) return NO; // 欺骗 App 已经录完了
-    return %orig;
-}
-
-- (void)beginRecordWithRecordPath:(NSString *)path {
-    showVoiceList();
-}
+- (void)beginRecordWithRecordPath:(NSString *)path { showVoiceList(); }
 %end
 
 %hook CWTalkBackView
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    showVoiceList();
-}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { showVoiceList(); }
 %end
 
 %hook CWRecordView
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    showVoiceList();
-}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { showVoiceList(); }
 %end
 
 %hook MessageDetailController
-- (void)recordSound {
-    showVoiceList();
-}
+- (void)recordSound { showVoiceList(); }
 %end
 
-// ===================== 8. 语音列表控制器实现 =====================
+// ===================== 语音列表 =====================
 @implementation VoicePackListVC
 
 - (void)viewDidLoad {
@@ -156,13 +115,10 @@ static void showVoiceList() {
     self.toolbarItems = @[videoBtn, space, linkBtn, space2, importBtn];
 }
 
-- (void)close {
-    stopPlayingAudio();
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
+- (void)close { stopPlayingAudio(); [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (void)createCategory {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"新建分类" message:@"分类功能开发中" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"新建分类" message:@"开发中" preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -177,7 +133,7 @@ static void showVoiceList() {
 }
 
 - (void)linkAction {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"链接转语音" message:@"功能开发中" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"链接转语音" message:@"开发中" preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -188,9 +144,7 @@ static void showVoiceList() {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.files.count;
-}
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return self.files.count; }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
@@ -231,32 +185,44 @@ static void showVoiceList() {
     if (!err && sharedAudioPlayer) [sharedAudioPlayer play];
 }
 
-// 🚨 带调试弹窗的发送逻辑
+// ===================== 核心发送（延迟 + 直接调用 V2TIM API） =====================
 - (void)sendAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     
+    // 1. 先关闭弹窗
     [self dismissViewControllerAnimated:YES completion:^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 2. 延迟 1 秒，确保聊天界面完全稳定
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             
             UIViewController *topVC = topViewController();
-            if (!g_chatVC) {
-                g_chatVC = findMessageDetailController(topVC);
-            }
-            if (!g_chatVC) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"未找到聊天界面，请先进入聊天！" preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                [topVC presentViewController:alert animated:YES completion:nil];
+            UIViewController *chatVC = findMessageDetailController(topVC);
+            
+            if (!chatVC) {
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"未找到聊天界面" preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [topVC presentViewController:a animated:YES completion:nil];
                 return;
             }
-
-            // 转码
+            
+            // 3. 提取接收者
+            NSString *receiver = nil;
+            @try { receiver = [chatVC valueForKey:@"friendUserId"]; } @catch (NSException *e) {}
+            
+            if (!receiver || receiver.length == 0) {
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"未获取到聊天对象ID" preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [topVC presentViewController:a animated:YES completion:nil];
+                return;
+            }
+            
+            // 4. 转码为 M4A
             NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
             
             AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-            g_voiceDurationToSend = (int)ceil(CMTimeGetSeconds(asset.duration));
-            if (g_voiceDurationToSend <= 0) g_voiceDurationToSend = 1;
+            int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+            if (duration <= 0) duration = 1;
             
             AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
             session.outputURL = [NSURL fileURLWithPath:outputPath];
@@ -264,32 +230,55 @@ static void showVoiceList() {
             
             [session exportAsynchronouslyWithCompletionHandler:^{
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    NSDictionary *outAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-                    if (session.status != AVAssetExportSessionStatusCompleted || !outAttrs || [outAttrs fileSize] == 0) {
-                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"转码失败" message:@"音频无法转换，请检查源文件。" preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                        [topVC presentViewController:alert animated:YES completion:nil];
-                        return;
-                    }
                     
-                    g_voicePathToSend = outputPath;
+                    // 5. 直接使用 V2TIM 官方 API 发送
+                    Class v2MgrClass = NSClassFromString(@"V2TIMManager");
+                    id manager = [v2MgrClass performSelector:@selector(sharedInstance)];
                     
-                    // 核心发送尝试
-                    if ([g_chatVC respondsToSelector:NSSelectorFromString(@"sendSound")]) {
-                        SEL sendSel = NSSelectorFromString(@"sendSound");
-                        NSMethodSignature *sendSig = [g_chatVC methodSignatureForSelector:sendSel];
-                        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-                        [sendInv setTarget:g_chatVC];
-                        [sendInv setSelector:sendSel];
-                        [sendInv invoke];
+                    // 构造语音消息
+                    SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+                    if ([manager respondsToSelector:createSel]) {
+                        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                        [inv setTarget:manager];
+                        [inv setSelector:createSel];
+                        __unsafe_unretained NSString *pathArg = outputPath;
+                        [inv setArgument:&pathArg atIndex:2];
+                        [inv setArgument:&duration atIndex:3];
+                        [inv invoke];
                         
-                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"已触发发送" message:@"已调用原生 sendSound，请查看聊天界面。" preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                        [topVC presentViewController:alert animated:YES completion:nil];
-                    } else {
-                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"聊天控制器不支持 sendSound 方法。" preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                        [topVC presentViewController:alert animated:YES completion:nil];
+                        __unsafe_unretained id msg = nil;
+                        [inv getReturnValue:&msg];
+                        
+                        // 发送
+                        SEL sendSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
+                        if ([manager respondsToSelector:sendSel]) {
+                            NSMethodSignature *sendSig = [manager methodSignatureForSelector:sendSel];
+                            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+                            [sendInv setTarget:manager];
+                            [sendInv setSelector:sendSel];
+                            
+                            [sendInv setArgument:&msg atIndex:2];
+                            __unsafe_unretained NSString *r = receiver;
+                            [sendInv setArgument:&r atIndex:3];
+                            __unsafe_unretained NSString *g = nil;
+                            [sendInv setArgument:&g atIndex:4];
+                            int priority = 0;
+                            [sendInv setArgument:&priority atIndex:5];
+                            BOOL onlineOnly = NO;
+                            [sendInv setArgument:&onlineOnly atIndex:6];
+                            __unsafe_unretained id pushInfo = nil;
+                            [sendInv setArgument:&pushInfo atIndex:7];
+                            __unsafe_unretained id progress = nil;
+                            [sendInv setArgument:&progress atIndex:8];
+                            __unsafe_unretained id succ = nil;
+                            [sendInv setArgument:&succ atIndex:9];
+                            __unsafe_unretained id fail = nil;
+                            [sendInv setArgument:&fail atIndex:10];
+                            [sendInv invoke];
+                            
+                            NSLog(@"[VoicePlugin] 已通过 V2TIM API 发送语音给 %@", receiver);
+                        }
                     }
                 });
             }];
@@ -300,7 +289,7 @@ static void showVoiceList() {
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
-
+    
     PHPickerResult *result = results.firstObject;
     if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
