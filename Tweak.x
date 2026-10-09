@@ -5,7 +5,6 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @interface MessageDetailController : UIViewController
-- (void)sendSound;
 - (void)sendMessage:(id)msg isRetry:(BOOL)retry;
 @end
 
@@ -213,7 +212,7 @@ static BOOL g_skipIntercept = NO;
 
 @end
 
-// ===================== 核心：拦截松手发送，用 V2TIM API 直接发 =====================
+// ===================== 核心：拦截松手，弹出列表，走第一版的 V2TIM 发送 =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
@@ -228,17 +227,16 @@ static BOOL g_skipIntercept = NO;
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     vc.onSelect = ^(NSString *path) {
         if (!path) {
-            // 使用原录音，走原生
-            g_skipIntercept = YES;
             NSLog(@"[VoicePlugin] 用户使用原录音");
+            g_skipIntercept = YES;
             return;
         }
         
-        // 用户选择了预设音频，转码后通过 V2TIM API 直接发送
+        // === 完全按照第一版的逻辑：转码到沙盒固定路径 → V2TIM 构造 → sendMessage:isRetry: ===
         NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
-            
+        
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-        __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+        int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
         if (duration <= 0) duration = 1;
         
         AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
@@ -252,6 +250,7 @@ static BOOL g_skipIntercept = NO;
                     NSLog(@"[VoicePlugin] 转码失败");
                     return;
                 }
+                NSLog(@"[VoicePlugin] 转码成功: %@", outputPath);
                 
                 // 获取聊天控制器
                 UIViewController *chatVC = findMessageDetailController(topViewController());
@@ -260,21 +259,17 @@ static BOOL g_skipIntercept = NO;
                     return;
                 }
                 
-                // 提取接收者
-                NSString *receiver = nil;
-                @try { receiver = [chatVC valueForKey:@"friendUserId"]; } @catch (NSException *e) {}
-                NSLog(@"[VoicePlugin] 接收者: %@", receiver);
-                
-                // 构造 V2TIM 消息
-                Class v2MgrClass = NSClassFromString(@"V2TIMManager");
-                id manager = [v2MgrClass performSelector:@selector(sharedInstance)];
-                
+                // === 完全照搬第一版：构造 V2TIM 语音消息 ===
+                Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
+                id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
                 SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+                
                 if ([manager respondsToSelector:createSel]) {
                     NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
                     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
                     [inv setTarget:manager];
                     [inv setSelector:createSel];
+                    
                     __unsafe_unretained NSString *pathArg = outputPath;
                     [inv setArgument:&pathArg atIndex:2];
                     [inv setArgument:&duration atIndex:3];
@@ -283,7 +278,7 @@ static BOOL g_skipIntercept = NO;
                     __unsafe_unretained id msg = nil;
                     [inv getReturnValue:&msg];
                     
-                    // 用 App 自己的 sendMessage:isRetry: 发送
+                    // === 完全照搬第一版：调用 sendMessage:isRetry: ===
                     SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
                     if ([chatVC respondsToSelector:sendSel]) {
                         NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
@@ -294,9 +289,9 @@ static BOOL g_skipIntercept = NO;
                         BOOL retry = NO;
                         [sendInv setArgument:&retry atIndex:3];
                         [sendInv invoke];
-                        NSLog(@"[VoicePlugin] 已调用 sendMessage:isRetry: 发送");
+                        NSLog(@"[VoicePlugin] 已发送");
                     } else {
-                        NSLog(@"[VoicePlugin] 聊天控制器不支持 sendMessage:isRetry:");
+                        NSLog(@"[VoicePlugin] 无 sendMessage:isRetry:");
                     }
                 }
             });
@@ -305,7 +300,6 @@ static BOOL g_skipIntercept = NO;
     
     vc.onCancel = ^{
         g_skipIntercept = YES;
-        NSLog(@"[VoicePlugin] 用户取消");
     };
     
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
@@ -315,13 +309,13 @@ static BOOL g_skipIntercept = NO;
 
 %end
 
-// 拦截原生发送，避免用户点击后重复发送原录音
+// 拦截原生 sendSound，避免重复发送
 %hook MessageDetailController
 - (void)sendSound {
     if (g_skipIntercept) {
         g_skipIntercept = NO;
         return;
     }
-    NSLog(@"[VoicePlugin] 拦截 sendSound，不发送");
+    NSLog(@"[VoicePlugin] 拦截原生 sendSound（不发送）");
 }
 %end
