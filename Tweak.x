@@ -8,10 +8,9 @@
 @interface MessageDetailController : UIViewController
 @end
 
-// 🚨 关键修复：把列表控制器的声明提前，让后面的代码能认识它
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
-@property (nonatomic, assign) UIViewController *chatVC;
+@property (nonatomic, weak) UIViewController *chatVC; // 改成 weak，避免悬垂指针
 @end
 
 // ===================== 2. 沙盒路径 =====================
@@ -84,14 +83,14 @@ static void showVoiceList() {
     
     if ([topVC isKindOfClass:NSClassFromString(@"VoicePackListVC")]) return;
     
-    VoicePackListVC *listVC = [[VoicePackListVC alloc] init]; // 现在编译器认识它了
+    VoicePackListVC *listVC = [[VoicePackListVC alloc] init];
     listVC.chatVC = chatVC;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-// ===================== 7. 拦截底层录音路径与启动 =====================
+// ===================== 7. 拦截底层录音启动 =====================
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
@@ -100,37 +99,31 @@ static void showVoiceList() {
     return %orig;
 }
 
-// 一旦 App 试图启动录音，立刻拦截，弹出列表！
 - (void)beginRecordWithRecordPath:(NSString *)path {
     NSLog(@"[VoicePlugin] 底层拦截到录音启动，弹出语音列表");
     showVoiceList();
 }
 %end
 
-// ===================== 8. 拦截触摸事件 =====================
 %hook CWTalkBackView
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    NSLog(@"[VoicePlugin] 拦截到录音视图触摸，弹出语音列表");
     showVoiceList();
 }
 %end
 
 %hook CWRecordView
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    NSLog(@"[VoicePlugin] 拦截到录音视图触摸，弹出语音列表");
     showVoiceList();
 }
 %end
 
-// ===================== 9. 同时保留 recordSound 拦截 =====================
 %hook MessageDetailController
 - (void)recordSound {
-    NSLog(@"[VoicePlugin] 拦截到 recordSound，弹出语音列表");
     showVoiceList();
 }
 %end
 
-// ===================== 10. 语音列表控制器实现 =====================
+// ===================== 8. 语音列表控制器实现 =====================
 @implementation VoicePackListVC
 
 - (void)viewDidLoad {
@@ -227,33 +220,64 @@ static void showVoiceList() {
     if (!err && sharedAudioPlayer) [sharedAudioPlayer play];
 }
 
+// 🚨 核心修复：发送逻辑
 - (void)sendAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     
+    // 关闭列表，把后续逻辑放到 completion 里，确保在聊天界面执行
     [self dismissViewControllerAnimated:YES completion:^{
-        NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
-        NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
-        
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-        AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-        session.outputURL = [NSURL fileURLWithPath:outputPath];
-        session.outputFileType = AVFileTypeAppleM4A;
-        
-        [session exportAsynchronouslyWithCompletionHandler:^{
-            dispatch_async(dispatch_get_main_queue(), ^{
-                g_voicePathToSend = outputPath;
-                
-                if (self.chatVC && [self.chatVC respondsToSelector:NSSelectorFromString(@"sendSound")]) {
-                    SEL sendSel = NSSelectorFromString(@"sendSound");
-                    NSMethodSignature *sendSig = [self.chatVC methodSignatureForSelector:sendSel];
-                    NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-                    [sendInv setTarget:self.chatVC];
-                    [sendInv setSelector:sendSel];
-                    [sendInv invoke];
-                }
-            });
-        }];
+        // 给界面一点时间完成布局切换
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 1. 重新查找当前聊天控制器（不再依赖 self.chatVC）
+            UIViewController *topVC = topViewController();
+            UIViewController *chatVC = findMessageDetailController(topVC);
+            
+            if (!chatVC) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"请先进入聊天界面！" preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [topVC presentViewController:alert animated:YES completion:nil];
+                return;
+            }
+
+            // 2. 转码为 M4A
+            NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
+            NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
+            
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+            AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+            session.outputURL = [NSURL fileURLWithPath:outputPath];
+            session.outputFileType = AVFileTypeAppleM4A;
+            
+            [session exportAsynchronouslyWithCompletionHandler:^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSDictionary *outAttrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
+                    if (session.status != AVAssetExportSessionStatusCompleted || !outAttrs || [outAttrs fileSize] == 0) {
+                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"转码失败" message:@"音频无法转换，请换个文件试试。" preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                        [topVC presentViewController:alert animated:YES completion:nil];
+                        return;
+                    }
+                    
+                    // 3. 设置全局录音路径替换
+                    g_voicePathToSend = outputPath;
+                    NSLog(@"[VoicePlugin] 转码完成，准备调用 sendSound");
+                    
+                    // 4. 调用 App 原生的 sendSound
+                    if ([chatVC respondsToSelector:NSSelectorFromString(@"sendSound")]) {
+                        SEL sendSel = NSSelectorFromString(@"sendSound");
+                        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+                        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+                        [sendInv setTarget:chatVC];
+                        [sendInv setSelector:sendSel];
+                        [sendInv invoke];
+                        NSLog(@"[VoicePlugin] 已触发原生 sendSound");
+                    } else {
+                        NSLog(@"[VoicePlugin] 聊天界面不响应 sendSound");
+                    }
+                });
+            }];
+        });
     }];
 }
 
