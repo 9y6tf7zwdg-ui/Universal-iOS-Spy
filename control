@@ -1,0 +1,9 @@
+Package: com.yourname.universalspy
+Name: UniversalSpy
+Version: 2.0.0
+Architecture: iphoneos-arm64
+Description: 通用 iOS App 类名与方法名侦察工具
+Maintainer: You
+Author: You
+Section: Tweaks
+Depends: mobilesubstrate
