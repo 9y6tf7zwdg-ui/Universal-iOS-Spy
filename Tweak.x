@@ -29,21 +29,25 @@ static BOOL isScanning = NO;
     spyButton.backgroundColor = [UIColor colorWithRed:1 green:0.5 blue:0 alpha:0.8]; // 扫描中变橙色
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-        NSMutableString *output = [NSMutableString string];
-        [output appendFormat:@"==== 侦察报告: %@ ====\n\n", bundleID];
+        NSMutableString *resultText = [NSMutableString string];
+        [resultText appendString:@"==== 侦察结果 (仅显示相关类) ====\n\n"];
+        
+        // 要匹配的关键词
+        NSArray *keywords = @[@"chat", @"message", @"voice", @"input", @"send", @"record", @"gift", @"user", @"msg"];
         
         int numClasses = objc_getClassList(NULL, 0);
         Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
         objc_getClassList(classes, numClasses);
         
-        int count = 0;
+        int foundCount = 0;
+        
         for (int i = 0; i < numClasses; i++) {
             Class cls = classes[i];
             const char *className = class_getName(cls);
             NSString *classStr = [NSString stringWithUTF8String:className];
+            NSString *lowerClass = [classStr lowercaseString];
             
-            // 【深度优化】过滤系统底层类，只保留业务逻辑类
+            // 过滤系统类
             if ([classStr hasPrefix:@"UI"] || [classStr hasPrefix:@"NS"] || 
                 [classStr hasPrefix:@"CA"] || [classStr hasPrefix:@"AV"] || 
                 [classStr hasPrefix:@"WK"] || [classStr hasPrefix:@"_"] || 
@@ -52,14 +56,29 @@ static BOOL isScanning = NO;
                 continue;
             }
             
-            [output appendFormat:@"[Class] %@\n", classStr];
+            BOOL classMatched = NO;
+            for (NSString *kw in keywords) {
+                if ([lowerClass containsString:kw]) {
+                    classMatched = YES;
+                    break;
+                }
+            }
+            
+            NSMutableArray *matchedMethods = [NSMutableArray array];
             
             // 获取实例方法
             unsigned int methodCount;
             Method *methods = class_copyMethodList(cls, &methodCount);
             for (int j = 0; j < methodCount; j++) {
                 NSString *methodName = NSStringFromSelector(method_getName(methods[j]));
-                [output appendFormat:@"  - %@\n", methodName];
+                NSString *lowerMethod = [methodName lowercaseString];
+                for (NSString *kw in keywords) {
+                    if ([lowerMethod containsString:kw]) {
+                        [matchedMethods addObject:[NSString stringWithFormat:@"  - %@", methodName]];
+                        classMatched = YES; // 如果方法匹配，也把类显示出来
+                        break;
+                    }
+                }
             }
             free(methods);
             
@@ -68,54 +87,50 @@ static BOOL isScanning = NO;
             Method *classMethods = class_copyMethodList(metaClass, &methodCount);
             for (int j = 0; j < methodCount; j++) {
                 NSString *methodName = NSStringFromSelector(method_getName(classMethods[j]));
-                [output appendFormat:@"  + %@\n", methodName];
+                NSString *lowerMethod = [methodName lowercaseString];
+                for (NSString *kw in keywords) {
+                    if ([lowerMethod containsString:kw]) {
+                        [matchedMethods addObject:[NSString stringWithFormat:@"  + %@", methodName]];
+                        classMatched = YES;
+                        break;
+                    }
+                }
             }
             free(classMethods);
             
-            count++;
+            if (classMatched) {
+                [resultText appendFormat:@"[Class] %@\n", classStr];
+                for (NSString *m in matchedMethods) {
+                    [resultText appendFormat:@"%@\n", m];
+                }
+                [resultText appendString:@"\n"];
+                foundCount++;
+            }
         }
         free(classes);
-        [output appendFormat:@"\n共找到 %d 个非系统类", count];
         
-        // 1. 写入 App 沙盒的 Documents 目录
-        NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *fileName = [NSString stringWithFormat:@"Spy_%@.txt", bundleID];
-        NSString *filePath = [docPath stringByAppendingPathComponent:fileName];
-        NSError *error;
-        [output writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:&error];
+        [resultText appendFormat:@"\n共找到 %d 个相关类", foundCount];
         
-        // 2. 在全局越狱目录也备份一份（彻底解决找不到文件的问题）
-        NSString *globalDir = @"/var/mobile/Documents/UniversalSpy/";
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:globalDir]) {
-            [fm createDirectoryAtPath:globalDir withIntermediateDirectories:YES attributes:nil error:nil];
+        // 将结果转为字符串，如果太长则截断（防止 UIAlertController 崩溃）
+        NSString *finalText = [resultText copy];
+        if (finalText.length > 2000) {
+            finalText = [[finalText substringToIndex:2000] stringByAppendingString:@"\n\n... (内容过长已截断，请点击复制结果查看全部)"];
         }
-        NSString *globalPath = [globalDir stringByAppendingPathComponent:fileName];
-        [output writeToFile:globalPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         
-        // 3. 回到主线程弹窗提示
+        // 回到主线程弹窗提示
         dispatch_async(dispatch_get_main_queue(), ^{
             isScanning = NO;
             spyButton.backgroundColor = [UIColor colorWithRed:0 green:1 blue:0 alpha:0.5]; // 恢复绿色
             
-            if (error) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"写入失败" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-                [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-                return;
-            }
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"找到 %d 个相关类", foundCount] message:finalText preferredStyle:UIAlertControllerStyleAlert];
             
-            NSString *msg = [NSString stringWithFormat:@"扫描完成！共发现 %d 个类。\n\n文件已保存至:\n%@\n(同时在全局目录:/var/mobile/Documents/UniversalSpy/ 也备份了一份)", count, filePath];
-            
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"扫描结果" message:msg preferredStyle:UIAlertControllerStyleAlert];
-            
-            // 复制路径按钮
-            [alert addAction:[UIAlertAction actionWithTitle:@"复制路径" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                [UIPasteboard generalPasteboard].string = globalPath; // 复制全局路径，方便在 Filza 直接前往
+            // 复制全部结果按钮（解决内容过长的问题）
+            [alert addAction:[UIAlertAction actionWithTitle:@"复制全部结果" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [UIPasteboard generalPasteboard].string = resultText;
             }]];
             
             // 关闭按钮
-            [alert addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
             
             [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
         });
@@ -127,7 +142,6 @@ static BOOL isScanning = NO;
 // 创建悬浮窗 UI (适配 iOS 16 的 UIWindowScene)
 static void createSpyUI() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 获取当前活跃的 UIWindowScene
         UIWindowScene *windowScene = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
@@ -136,7 +150,7 @@ static void createSpyUI() {
             }
         }
         
-        if (!windowScene) return; // 场景未就绪
+        if (!windowScene) return;
         
         spyWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
         spyWindow.frame = CGRectMake(120, 120, 60, 60);
