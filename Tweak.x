@@ -4,6 +4,10 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+// ===================== 关键修复：显式声明继承关系，解决编译报错 =====================
+@interface MessageDetailController : UIViewController
+@end
+
 // ===================== 沙盒路径 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -54,7 +58,7 @@ static void stopPlayingAudio() {
 // ===================== 全局变量，用于替换录音路径 =====================
 static NSString *g_voicePathToSend = nil;
 
-// 1. Hook 日志里的 CWRecorder 替换录音路径
+// 1. 拦截录音路径
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
@@ -257,16 +261,14 @@ static NSString *g_voicePathToSend = nil;
 // ===================== 核心：根据日志，Hook 录音按钮 =====================
 %hook MessageDetailController
 
-// 日志中明确写了这个方法，点击麦克风时会触发
 - (void)recordSound {
     // 不调用 %orig，彻底阻止 App 启动原生录音
     NSLog(@"[VoicePlugin] 拦截到 recordSound，弹出语音列表");
     
     VoicePackListVC *listVC = [[VoicePackListVC alloc] init];
-    listVC.chatVC = self; // 把当前的聊天控制器传给列表
+    listVC.chatVC = self; // 现在编译器知道 self 是 UIViewController 子类，赋值合法
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
     
-    // 使用系统原生底部弹窗
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [self presentViewController:nav animated:YES completion:nil];
 }
