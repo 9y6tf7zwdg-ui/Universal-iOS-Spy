@@ -5,10 +5,10 @@
 @interface MessageDetailController : UIViewController
 @end
 
-// 存放转换后音频的路径
+// 存放转换后音频的全局路径
 static NSString *convertedVoicePath = nil;
 
-// 1. 自动转码器：把任意音频转为 M4A
+// 1. 自动转码器：把任意音频（WAV/MP3）转为标准的 M4A
 static void convertToM4A(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) {
@@ -32,7 +32,7 @@ static void convertToM4A(NSString *inputPath, NSString *outputPath, void (^compl
     }];
 }
 
-// 2. 获取沙盒源文件路径
+// 2. 获取沙盒中的源文件路径
 static NSString *getSourceVoicePath() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -40,8 +40,8 @@ static NSString *getSourceVoicePath() {
     if (![fm fileExistsAtPath:voiceDir]) {
         [fm createDirectoryAtPath:voiceDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    // 检测源文件，优先 wav，其次 mp3，最后 m4a
-    NSArray *exts = @[@"wav", @"mp3", @"m4a"];
+    // 优先读取 wav，其次 mp3
+    NSArray *exts = @[@"wav", @"mp3"];
     for (NSString *ext in exts) {
         NSString *path = [voiceDir stringByAppendingPathComponent:[NSString stringWithFormat:@"test.%@", ext]];
         if ([fm fileExistsAtPath:path]) return path;
@@ -49,7 +49,7 @@ static NSString *getSourceVoicePath() {
     return nil;
 }
 
-// 3. Hook 录音路径
+// 3. 拦截底层录音路径，把 App 骗过去
 %hook CWRecorder
 
 - (NSString *)recordPath {
@@ -62,7 +62,7 @@ static NSString *getSourceVoicePath() {
 
 %end
 
-// 4. Hook 聊天控制器
+// 4. 在聊天界面注入按钮
 %hook MessageDetailController
 
 - (void)viewDidLoad {
@@ -72,7 +72,7 @@ static NSString *getSourceVoicePath() {
         UIView *inputBanner = [self valueForKey:@"inputBannerView"];
         if (!inputBanner) return;
         
-        if ([inputBanner viewWithTag:9999]) return;
+        if ([inputBanner viewWithTag:9999]) return; // 防止重复添加
         
         UIButton *voiceBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         voiceBtn.tag = 9999;
@@ -110,9 +110,9 @@ static NSString *getSourceVoicePath() {
     convertToM4A(sourcePath, outputPath, ^(BOOL success) {
         if (success) {
             NSLog(@"[VoicePlugin] 转码成功，准备发送");
-            convertedVoicePath = outputPath;
+            convertedVoicePath = outputPath; // 记录转码后的标准路径
             
-            // 🚨 修复点：用 NSInvocation 替代 performSelector，解决编译报错
+            // 使用 NSInvocation 动态调用 sendSound，解决 ARC 下的编译报错
             SEL sendSel = NSSelectorFromString(@"sendSound");
             if ([self respondsToSelector:sendSel]) {
                 NSMethodSignature *sendSig = [self methodSignatureForSelector:sendSel];
