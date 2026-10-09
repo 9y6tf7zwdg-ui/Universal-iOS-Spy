@@ -77,22 +77,46 @@ static BOOL isScanning = NO;
         free(classes);
         [output appendFormat:@"\n共找到 %d 个非系统类", count];
         
-        // 写入 App 沙盒的 Documents 目录
+        // 1. 写入 App 沙盒的 Documents 目录
         NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSString *fileName = [NSString stringWithFormat:@"Spy_%@.txt", bundleID];
         NSString *filePath = [docPath stringByAppendingPathComponent:fileName];
         NSError *error;
         [output writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:&error];
         
-        // 回到主线程提示
+        // 2. 在全局越狱目录也备份一份（彻底解决找不到文件的问题）
+        NSString *globalDir = @"/var/mobile/Documents/UniversalSpy/";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:globalDir]) {
+            [fm createDirectoryAtPath:globalDir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        NSString *globalPath = [globalDir stringByAppendingPathComponent:fileName];
+        [output writeToFile:globalPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        
+        // 3. 回到主线程弹窗提示
         dispatch_async(dispatch_get_main_queue(), ^{
             isScanning = NO;
             spyButton.backgroundColor = [UIColor colorWithRed:0 green:1 blue:0 alpha:0.5]; // 恢复绿色
             
-            NSString *msg = error ? [NSString stringWithFormat:@"写入失败: %@", error.localizedDescription] : [NSString stringWithFormat:@"扫描完成！\n共发现 %d 个类。\n文件已保存至:\nDocuments/%@", count, fileName];
+            if (error) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"写入失败" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+                [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+                return;
+            }
+            
+            NSString *msg = [NSString stringWithFormat:@"扫描完成！共发现 %d 个类。\n\n文件已保存至:\n%@\n(同时在全局目录:/var/mobile/Documents/UniversalSpy/ 也备份了一份)", count, filePath];
             
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"扫描结果" message:msg preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleDefault handler:nil]];
+            
+            // 复制路径按钮
+            [alert addAction:[UIAlertAction actionWithTitle:@"复制路径" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [UIPasteboard generalPasteboard].string = globalPath; // 复制全局路径，方便在 Filza 直接前往
+            }]];
+            
+            // 关闭按钮
+            [alert addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleCancel handler:nil]];
+            
             [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
         });
     });
@@ -112,7 +136,7 @@ static void createSpyUI() {
             }
         }
         
-        if (!windowScene) return; // 场景未就绪，稍后重试
+        if (!windowScene) return; // 场景未就绪
         
         spyWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
         spyWindow.frame = CGRectMake(120, 120, 60, 60);
@@ -144,15 +168,12 @@ static void createSpyUI() {
 
 // 插件加载入口
 __attribute__((constructor)) static void init() {
-    // 监听 App 启动完成通知，确保 UI 安全
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        // 延迟 2 秒显示，确保主界面和 Scene 完全初始化
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             createSpyUI();
         });
     }];
     
-    // 如果已经启动（比如注入后重新挂载），也尝试显示
     if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             createSpyUI();
