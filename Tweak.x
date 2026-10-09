@@ -4,17 +4,16 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// 🚨 修复1：把 sendSound 显式声明到接口里，让编译器认识它
 @interface MessageDetailController : UIViewController
 - (void)sendSound;
 @end
 
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
-@property (nonatomic, copy) void (^onSelect)(NSString *path); // nil = 使用刚录制的语音
+@property (nonatomic, copy) void (^onSelect)(NSString *path);
+@property (nonatomic, copy) void (^onCancel)(void);
 @end
 
-// ===================== 沙盒路径 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -38,15 +37,29 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     return voiceFiles;
 }
 
+static UIViewController *topViewController() {
+    UIWindow *keyWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+                if (window.isKeyWindow) { keyWindow = window; break; }
+            }
+        }
+    }
+    if (!keyWindow) return nil;
+    UIViewController *topVC = keyWindow.rootViewController;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+    return topVC;
+}
+
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) [sharedAudioPlayer stop];
     sharedAudioPlayer = nil;
 }
 
-// ===================== 全局变量 =====================
-static NSString *g_voicePathToSend = nil;   // 用户选中的替换音频
-static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循环
+static NSString *g_voicePathToSend = nil;
+static BOOL g_skipIntercept = NO;
 
 // ===================== 语音列表 =====================
 @implementation VoicePackListVC
@@ -58,7 +71,7 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     self.tableView.rowHeight = 64;
     [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"cell"];
     
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancel)];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancel)];
     
     self.navigationController.toolbarHidden = NO;
     UIBarButtonItem *videoBtn = [[UIBarButtonItem alloc] initWithTitle:@"视频转语音" style:UIBarButtonItemStylePlain target:self action:@selector(videoAction)];
@@ -70,7 +83,7 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
 
 - (void)cancel {
     stopPlayingAudio();
-    if (self.onSelect) self.onSelect(nil); // nil 表示取消整个发送
+    if (self.onCancel) self.onCancel();
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -83,7 +96,6 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 🚨 修复2：使用 iOS 14+ 新 API
 - (void)importAction {
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
     picker.delegate = self;
@@ -96,7 +108,6 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
-    
     UIView *rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 60, 40)];
     
     if (indexPath.row == 0) {
@@ -135,41 +146,32 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     stopPlayingAudio();
     
     NSString *selectedPath = nil;
-    if (indexPath.row == 0) {
-        selectedPath = nil; // 使用原录音
-    } else {
+    if (indexPath.row > 0) {
         NSString *fileName = self.files[indexPath.row - 1];
         selectedPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     }
-    
     if (self.onSelect) self.onSelect(selectedPath);
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
-// 相册视频转语音
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
-    
     PHPickerResult *result = results.firstObject;
     if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
             if (error || !url) return;
-            
             NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
             [fm copyItemAtPath:url.path toPath:tempPath error:&error];
             if (error) return;
-            
             NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-            
             AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tempPath] options:nil];
             AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
             session.outputURL = [NSURL fileURLWithPath:destPath];
             session.outputFileType = AVFileTypeAppleM4A;
-            
             [session exportAsynchronouslyWithCompletionHandler:^{
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (session.status == AVAssetExportSessionStatusCompleted) {
@@ -182,7 +184,6 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     }
 }
 
-// 文件导入
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
     NSURL *url = urls.firstObject;
@@ -198,45 +199,42 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
 
 @end
 
-// ===================== 关键拦截：录音结束、准备发送的那一刻 =====================
+// ===================== 核心：Hook sendSound，弹出列表 =====================
 %hook MessageDetailController
 
 - (void)sendSound {
-    // 二次调用，直接放行
+    // 二次调用：直接放行，让 App 走原流程
     if (g_skipIntercept) {
         g_skipIntercept = NO;
+        NSLog(@"[VoicePlugin] 二次进入 sendSound，放行 %orig");
         %orig;
         return;
     }
     
-    NSLog(@"[VoicePlugin] 拦截到 sendSound，弹出选择列表");
+    NSLog(@"[VoicePlugin] 拦截 sendSound，弹出语音列表");
     
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     __weak typeof(self) weakSelf = self;
+    
     vc.onSelect = ^(NSString *path) {
         if (path) {
-            // 用户选择了预设音频，先转码为 m4a
-            NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:@"temp_send_voice.m4a"];
-            [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
-            
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-            AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-            session.outputURL = [NSURL fileURLWithPath:outputPath];
-            session.outputFileType = AVFileTypeAppleM4A;
-            
-            [session exportAsynchronouslyWithCompletionHandler:^{
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    g_voicePathToSend = outputPath;
-                    g_skipIntercept = YES;
-                    [weakSelf sendSound];
-                });
-            }];
+            g_voicePathToSend = path;
+            NSLog(@"[VoicePlugin] 用户选择替换: %@", path);
         } else {
-            // 使用原录音，直接放行
             g_voicePathToSend = nil;
-            g_skipIntercept = YES;
-            [weakSelf sendSound];
+            NSLog(@"[VoicePlugin] 用户选择使用原录音");
         }
+        g_skipIntercept = YES;
+        // 关闭弹窗后调用原生 sendSound，走 App 自己的上传发送流程
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf sendSound];
+        });
+    };
+    
+    vc.onCancel = ^{
+        NSLog(@"[VoicePlugin] 用户取消发送");
+        g_voicePathToSend = nil;
+        g_skipIntercept = YES;
     };
     
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
@@ -250,7 +248,7 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
-        NSLog(@"[VoicePlugin] 替换录音路径为: %@", g_voicePathToSend);
+        NSLog(@"[VoicePlugin] CWRecorder.recordPath 返回替换路径: %@", g_voicePathToSend);
         return g_voicePathToSend;
     }
     return %orig;
