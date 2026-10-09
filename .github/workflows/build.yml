@@ -1,0 +1,30 @@
+name: Build Universal Spy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          export THEOS=/opt/theos
+          sudo git clone --recursive https://github.com/theos/theos.git $THEOS
+          sudo chown -R $(id -u):$(id -g) $THEOS
+
+      - name: Build Tweak
+        run: |
+          export THEOS=/opt/theos
+          make package
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: UniversalSpy
+          path: .theos/obj/debug/*.dylib
