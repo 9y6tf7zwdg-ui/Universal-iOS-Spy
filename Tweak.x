@@ -1,19 +1,42 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <AVFoundation/AVFoundation.h> 
 
-// 静态变量防止被 ARC 回收
+// 动态获取当前 App 沙盒内的 Documents 路径，并在其中创建 VoicePacks 文件夹
+static NSString *getSandboxVoicePath() {
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
+    
+    // 如果文件夹不存在，自动创建
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:voiceDir]) {
+        [fm createDirectoryAtPath:voiceDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSLog(@"[VoicePlugin] 已自动创建语音文件夹: %@", voiceDir);
+    }
+    
+    // 默认读取目录下的 test.m4a（建议使用 m4a，兼容性比 mp3 好）
+    return [voiceDir stringByAppendingPathComponent:@"test.m4a"];
+}
+
+// 获取音频真实时长（秒）
+static int getAudioDuration(NSString *path) {
+    NSURL *url = [NSURL fileURLWithPath:path];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+    CMTime time = asset.duration;
+    float seconds = CMTimeGetSeconds(time);
+    if (isnan(seconds) || seconds <= 0) return 1;
+    return (int)ceil(seconds); // 向上取整
+}
+
 static UIWindow *spyWindow;
 static UIButton *spyButton;
 static id spyTarget;
-static BOOL isScanning = NO;
 
-// 负责处理扫描逻辑的类
 @interface SpyHandler : NSObject
 @end
 
 @implementation SpyHandler
 
-// 拖拽悬浮球
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
     UIView *btn = gesture.view;
     CGPoint translation = [gesture translationInView:btn.superview];
@@ -21,125 +44,77 @@ static BOOL isScanning = NO;
     [gesture setTranslation:CGPointZero inView:btn.superview];
 }
 
-// 点击开始扫描
-- (void)startScan {
-    if (isScanning) return;
-    isScanning = YES;
+- (void)doDirectSend {
+    NSString *customVoicePath = getSandboxVoicePath();
     
-    spyButton.backgroundColor = [UIColor colorWithRed:1 green:0.5 blue:0 alpha:0.8]; // 扫描中变橙色
+    if (![[NSFileManager defaultManager] fileExistsAtPath:customVoicePath]) {
+        NSString *msg = [NSString stringWithFormat:@"请把音频文件（建议用 test.m4a）放到沙盒的 Documents/VoicePacks/ 目录下。\n\n你的沙盒路径是:\n%@", customVoicePath];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"找不到语音文件" message:msg preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    int duration = getAudioDuration(customVoicePath);
+    NSLog(@"[VoicePlugin] 准备发送语音，路径: %@，真实时长: %d 秒", customVoicePath, duration);
+
+    UIViewController *topVC = spyWindow.rootViewController;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSMutableString *resultText = [NSMutableString string];
-        [resultText appendString:@"==== 侦察结果 (仅显示相关类) ====\n\n"];
+    UIViewController *chatVC = [self findMessageDetailController:topVC];
+    if (!chatVC) {
+        NSLog(@"[VoicePlugin] 没找到聊天界面，请先进入聊天页面");
+        return;
+    }
+
+    // 利用 Runtime 构造 V2TIM 语音消息 (带真实时长)
+    Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
+    id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
+    
+    SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+    if ([manager respondsToSelector:createSel]) {
+        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv setTarget:manager];
+        [inv setSelector:createSel];
+        [inv setArgument:&customVoicePath atIndex:2];
+        [inv setArgument:&duration atIndex:3];
+        [inv invoke];
         
-        // 要匹配的关键词
-        NSArray *keywords = @[@"chat", @"message", @"voice", @"input", @"send", @"record", @"gift", @"user", @"msg"];
-        
-        int numClasses = objc_getClassList(NULL, 0);
-        Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
-        objc_getClassList(classes, numClasses);
-        
-        int foundCount = 0;
-        
-        for (int i = 0; i < numClasses; i++) {
-            Class cls = classes[i];
-            const char *className = class_getName(cls);
-            NSString *classStr = [NSString stringWithUTF8String:className];
-            NSString *lowerClass = [classStr lowercaseString];
+        __unsafe_unretained id msg = nil;
+        [inv getReturnValue:&msg];
+
+        // 调用聊天控制器发送
+        SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
+        if ([chatVC respondsToSelector:sendSel]) {
+            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+            [sendInv setTarget:chatVC];
+            [sendInv setSelector:sendSel];
+            [sendInv setArgument:&msg atIndex:2];
+            BOOL isRetry = NO;
+            [sendInv setArgument:&isRetry atIndex:3];
+            [sendInv invoke];
             
-            // 过滤系统类
-            if ([classStr hasPrefix:@"UI"] || [classStr hasPrefix:@"NS"] || 
-                [classStr hasPrefix:@"CA"] || [classStr hasPrefix:@"AV"] || 
-                [classStr hasPrefix:@"WK"] || [classStr hasPrefix:@"_"] || 
-                [classStr hasPrefix:@"OS_"] || [classStr hasPrefix:@"CC"] ||
-                [classStr hasPrefix:@"SK"] || [classStr hasPrefix:@"CL"]) {
-                continue;
-            }
-            
-            BOOL classMatched = NO;
-            for (NSString *kw in keywords) {
-                if ([lowerClass containsString:kw]) {
-                    classMatched = YES;
-                    break;
-                }
-            }
-            
-            NSMutableArray *matchedMethods = [NSMutableArray array];
-            
-            // 获取实例方法
-            unsigned int methodCount;
-            Method *methods = class_copyMethodList(cls, &methodCount);
-            for (int j = 0; j < methodCount; j++) {
-                NSString *methodName = NSStringFromSelector(method_getName(methods[j]));
-                NSString *lowerMethod = [methodName lowercaseString];
-                for (NSString *kw in keywords) {
-                    if ([lowerMethod containsString:kw]) {
-                        [matchedMethods addObject:[NSString stringWithFormat:@"  - %@", methodName]];
-                        classMatched = YES; // 如果方法匹配，也把类显示出来
-                        break;
-                    }
-                }
-            }
-            free(methods);
-            
-            // 获取类方法
-            Class metaClass = object_getClass(cls);
-            Method *classMethods = class_copyMethodList(metaClass, &methodCount);
-            for (int j = 0; j < methodCount; j++) {
-                NSString *methodName = NSStringFromSelector(method_getName(classMethods[j]));
-                NSString *lowerMethod = [methodName lowercaseString];
-                for (NSString *kw in keywords) {
-                    if ([lowerMethod containsString:kw]) {
-                        [matchedMethods addObject:[NSString stringWithFormat:@"  + %@", methodName]];
-                        classMatched = YES;
-                        break;
-                    }
-                }
-            }
-            free(classMethods);
-            
-            if (classMatched) {
-                [resultText appendFormat:@"[Class] %@\n", classStr];
-                for (NSString *m in matchedMethods) {
-                    [resultText appendFormat:@"%@\n", m];
-                }
-                [resultText appendString:@"\n"];
-                foundCount++;
-            }
+            NSLog(@"[VoicePlugin] 语音已触发直接发送！");
+        } else {
+            NSLog(@"[VoicePlugin] 聊天控制器没有 sendMessage:isRetry: 方法");
         }
-        free(classes);
-        
-        [resultText appendFormat:@"\n共找到 %d 个相关类", foundCount];
-        
-        // 将结果转为字符串，如果太长则截断（防止 UIAlertController 崩溃）
-        NSString *finalText = [resultText copy];
-        if (finalText.length > 2000) {
-            finalText = [[finalText substringToIndex:2000] stringByAppendingString:@"\n\n... (内容过长已截断，请点击复制结果查看全部)"];
-        }
-        
-        // 回到主线程弹窗提示
-        dispatch_async(dispatch_get_main_queue(), ^{
-            isScanning = NO;
-            spyButton.backgroundColor = [UIColor colorWithRed:0 green:1 blue:0 alpha:0.5]; // 恢复绿色
-            
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"找到 %d 个相关类", foundCount] message:finalText preferredStyle:UIAlertControllerStyleAlert];
-            
-            // 复制全部结果按钮（解决内容过长的问题）
-            [alert addAction:[UIAlertAction actionWithTitle:@"复制全部结果" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                [UIPasteboard generalPasteboard].string = resultText;
-            }]];
-            
-            // 关闭按钮
-            [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-            
-            [spyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-    });
+    }
+}
+
+- (UIViewController *)findMessageDetailController:(UIViewController *)vc {
+    if ([vc isKindOfClass:NSClassFromString(@"MessageDetailController")]) return vc;
+    for (UIViewController *child in vc.childViewControllers) {
+        UIViewController *found = [self findMessageDetailController:child];
+        if (found) return found;
+    }
+    if (vc.presentedViewController) return [self findMessageDetailController:vc.presentedViewController];
+    return nil;
 }
 
 @end
 
-// 创建悬浮窗 UI (适配 iOS 16 的 UIWindowScene)
 static void createSpyUI() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindowScene *windowScene = nil;
@@ -149,7 +124,6 @@ static void createSpyUI() {
                 break;
             }
         }
-        
         if (!windowScene) return;
         
         spyWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
@@ -165,13 +139,9 @@ static void createSpyUI() {
         spyButton.frame = CGRectMake(0, 0, 60, 60);
         spyButton.backgroundColor = [UIColor colorWithRed:0 green:1 blue:0 alpha:0.5];
         spyButton.layer.cornerRadius = 30;
-        spyButton.layer.shadowColor = [UIColor blackColor].CGColor;
-        spyButton.layer.shadowOffset = CGSizeMake(0, 2);
-        spyButton.layer.shadowOpacity = 0.5;
-        spyButton.layer.shadowRadius = 2;
         spyButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-        [spyButton setTitle:@"侦" forState:UIControlStateNormal];
-        [spyButton addTarget:spyTarget action:@selector(startScan) forControlEvents:UIControlEventTouchUpInside];
+        [spyButton setTitle:@"发" forState:UIControlStateNormal];
+        [spyButton addTarget:spyTarget action:@selector(doDirectSend) forControlEvents:UIControlEventTouchUpInside];
         
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:spyTarget action:@selector(handlePan:)];
         [spyButton addGestureRecognizer:pan];
@@ -180,8 +150,10 @@ static void createSpyUI() {
     });
 }
 
-// 插件加载入口
 __attribute__((constructor)) static void init() {
+    // 插件加载时，先尝试创建沙盒文件夹
+    getSandboxVoicePath();
+    
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             createSpyUI();
