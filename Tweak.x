@@ -2,7 +2,6 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 
-// 👇 解决编译报错的关键声明
 @interface MessageDetailController : UIViewController
 @end
 
@@ -18,16 +17,6 @@ static NSString *getSandboxVoicePath() {
     return [voiceDir stringByAppendingPathComponent:@"test.m4a"];
 }
 
-// 获取音频真实时长（秒）
-static int getAudioDuration(NSString *path) {
-    NSURL *url = [NSURL fileURLWithPath:path];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
-    CMTime time = asset.duration;
-    float seconds = CMTimeGetSeconds(time);
-    if (isnan(seconds) || seconds <= 0) return 1;
-    return (int)ceil(seconds);
-}
-
 %hook MessageDetailController
 
 - (void)viewDidLoad {
@@ -35,12 +24,9 @@ static int getAudioDuration(NSString *path) {
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIView *inputBanner = [self valueForKey:@"inputBannerView"];
-        
-        // 备用方案：如果 KVC 找不到，就遍历子视图寻找输入栏
         if (!inputBanner) {
             for (UIView *subview in self.view.subviews) {
-                // 通过类名粗略判断，或者判断高度
-                if ([subview isKindOfClass:NSClassFromString(@"HCPLPInputBannerView")] || subview.frame.size.height < 80) {
+                if (subview.frame.size.height < 80 && subview.frame.size.height > 40) {
                     inputBanner = subview;
                     break;
                 }
@@ -48,7 +34,7 @@ static int getAudioDuration(NSString *path) {
         }
         
         if (inputBanner) {
-            if ([inputBanner viewWithTag:9999]) return; // 防止重复添加
+            if ([inputBanner viewWithTag:9999]) return;
             
             UIButton *voiceBtn = [UIButton buttonWithType:UIButtonTypeCustom];
             voiceBtn.tag = 9999;
@@ -58,18 +44,12 @@ static int getAudioDuration(NSString *path) {
             [voiceBtn addTarget:self action:@selector(doDirectSendVoice) forControlEvents:UIControlEventTouchUpInside];
             
             [inputBanner addSubview:voiceBtn];
-            
-            // 自动布局：放在输入栏右侧（距离右边 10 像素），你可以根据需要调整常量
             [NSLayoutConstraint activateConstraints:@[
                 [voiceBtn.centerYAnchor constraintEqualToAnchor:inputBanner.centerYAnchor],
                 [voiceBtn.rightAnchor constraintEqualToAnchor:inputBanner.rightAnchor constant:-10],
                 [voiceBtn.widthAnchor constraintEqualToConstant:30],
                 [voiceBtn.heightAnchor constraintEqualToConstant:30]
             ]];
-            
-            NSLog(@"[VoicePlugin] 按钮已成功添加到输入栏！");
-        } else {
-            NSLog(@"[VoicePlugin] 没找到 inputBannerView，请检查类名");
         }
     });
 }
@@ -79,49 +59,58 @@ static int getAudioDuration(NSString *path) {
     NSString *customVoicePath = getSandboxVoicePath();
     
     if (![[NSFileManager defaultManager] fileExistsAtPath:customVoicePath]) {
-        NSString *msg = [NSString stringWithFormat:@"请把音频文件（建议用 test.m4a）放到沙盒的 Documents/VoicePacks/ 目录下。\n\n路径: %@", customVoicePath];
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"找不到语音文件" message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleDefault handler:nil]];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"找不到语音文件" message:[NSString stringWithFormat:@"请把音频文件放到: %@", customVoicePath] preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }
 
-    int duration = getAudioDuration(customVoicePath);
-    NSLog(@"[VoicePlugin] 直接发送语音: %@，时长: %d 秒", customVoicePath, duration);
+    NSLog(@"[VoicePlugin] 尝试走内部录音与发送流程: %@", customVoicePath);
 
-    // 构造 V2TIM 语音消息
-    Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
-    id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
+    // 1. 尝试获取 CWRecorder 实例
+    id recorder = nil;
+    @try {
+        recorder = [self valueForKey:@"recorder"]; // 尝试 KVC 获取
+    } @catch (NSException *exception) {
+        NSLog(@"[VoicePlugin] KVC 找不到 recorder 属性");
+    }
     
-    SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-    if ([manager respondsToSelector:createSel]) {
-        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        [inv setTarget:manager];
-        [inv setSelector:createSel];
-        [inv setArgument:&customVoicePath atIndex:2];
-        [inv setArgument:&duration atIndex:3];
-        [inv invoke];
-        
-        __unsafe_unretained id msg = nil;
-        [inv getReturnValue:&msg];
-
-        // 调用自身的发送方法
-        SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if ([self respondsToSelector:sendSel]) {
-            NSMethodSignature *sendSig = [self methodSignatureForSelector:sendSel];
-            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-            [sendInv setTarget:self];
-            [sendInv setSelector:sendSel];
-            [sendInv setArgument:&msg atIndex:2];
-            BOOL isRetry = NO;
-            [sendInv setArgument:&isRetry atIndex:3];
-            [sendInv invoke];
-            
-            NSLog(@"[VoicePlugin] 语音发送成功！");
-        } else {
-            NSLog(@"[VoicePlugin] 找不到 sendMessage:isRetry: 方法");
+    // 如果 KVC 失败，尝试在子视图中找 CWTalkBackView 或 CWRecordView
+    if (!recorder) {
+        for (UIView *sub in self.view.subviews) {
+            if ([sub isKindOfClass:NSClassFromString(@"CWTalkBackView")] || [sub isKindOfClass:NSClassFromString(@"CWRecordView")]) {
+                recorder = sub;
+                break;
+            }
         }
+    }
+    
+    if (recorder && [recorder respondsToSelector:NSSelectorFromString(@"beginRecordWithRecordPath:")]) {
+        // 欺骗 App：开始录音，但传入我们的路径
+        SEL beginSel = NSSelectorFromString(@"beginRecordWithRecordPath:");
+        NSMethodSignature *beginSig = [recorder methodSignatureForSelector:beginSel];
+        NSInvocation *beginInv = [NSInvocation invocationWithMethodSignature:beginSig];
+        [beginInv setTarget:recorder];
+        [beginInv setSelector:beginSel];
+        [beginInv setArgument:&customVoicePath atIndex:2];
+        [beginInv invoke];
+        
+        // 立刻结束录音，触发 App 内部状态机
+        if ([recorder respondsToSelector:NSSelectorFromString(@"endRecord")]) {
+            [recorder performSelector:NSSelectorFromString(@"endRecord")];
+        }
+        
+        // 调用 MessageDetailController 自己的发送方法，此时它会拿到我们刚刚“录制”的路径
+        if ([self respondsToSelector:NSSelectorFromString(@"sendSound")]) {
+            [self performSelector:NSSelectorFromString(@"sendSound")];
+            NSLog(@"[VoicePlugin] 成功触发内部发送流程");
+        }
+    } else {
+        NSLog(@"[VoicePlugin] 找不到 CWRecorder 实例或方法，无法走内部流程");
+        // 备用方案：如果找不到 recorder，只能弹窗提示
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"发送失败" message:@"无法获取底层录音器，请检查是否在聊天界面。" preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
     }
 }
 
