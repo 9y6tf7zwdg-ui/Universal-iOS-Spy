@@ -4,7 +4,9 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+// 🚨 修复1：把 sendSound 显式声明到接口里，让编译器认识它
 @interface MessageDetailController : UIViewController
+- (void)sendSound;
 @end
 
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
@@ -81,13 +83,13 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+// 🚨 修复2：使用 iOS 14+ 新 API
 - (void)importAction {
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"] inMode:UIDocumentPickerModeImport];
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 第一行是"使用刚录制的语音"，后面是预设文件
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return self.files.count + 1;
 }
@@ -98,7 +100,6 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
     UIView *rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 60, 40)];
     
     if (indexPath.row == 0) {
-        // 使用刚录制的语音
         cell.textLabel.text = @"🎤 使用刚录制的语音";
         cell.detailTextLabel.text = @"点击发送刚才按住的录音";
     } else {
@@ -208,14 +209,13 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
         return;
     }
     
-    // 首次调用：弹出列表让用户选择
     NSLog(@"[VoicePlugin] 拦截到 sendSound，弹出选择列表");
     
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     __weak typeof(self) weakSelf = self;
     vc.onSelect = ^(NSString *path) {
         if (path) {
-            // 用户选择了预设音频，需要先转码为 m4a
+            // 用户选择了预设音频，先转码为 m4a
             NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:@"temp_send_voice.m4a"];
             [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
             
@@ -228,7 +228,7 @@ static BOOL g_skipIntercept = NO;           // 二次调用标志，避免死循
                 dispatch_async(dispatch_get_main_queue(), ^{
                     g_voicePathToSend = outputPath;
                     g_skipIntercept = YES;
-                    [weakSelf sendSound]; // 再次进入 Hook，这次放行
+                    [weakSelf sendSound];
                 });
             }];
         } else {
