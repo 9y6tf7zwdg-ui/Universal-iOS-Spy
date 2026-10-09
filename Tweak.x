@@ -212,7 +212,7 @@ static BOOL g_skipIntercept = NO;
 
 @end
 
-// ===================== 核心：拦截松手，弹出列表，走第一版的 V2TIM 发送 =====================
+// ===================== 核心发送 =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
@@ -232,11 +232,11 @@ static BOOL g_skipIntercept = NO;
             return;
         }
         
-        // === 完全按照第一版的逻辑：转码到沙盒固定路径 → V2TIM 构造 → sendMessage:isRetry: ===
         NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
         
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-        int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+        // 🚨 加 __block 解决 const 报错
+        __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
         if (duration <= 0) duration = 1;
         
         AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
@@ -252,14 +252,12 @@ static BOOL g_skipIntercept = NO;
                 }
                 NSLog(@"[VoicePlugin] 转码成功: %@", outputPath);
                 
-                // 获取聊天控制器
                 UIViewController *chatVC = findMessageDetailController(topViewController());
                 if (!chatVC) {
                     NSLog(@"[VoicePlugin] 找不到聊天控制器");
                     return;
                 }
                 
-                // === 完全照搬第一版：构造 V2TIM 语音消息 ===
                 Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
                 id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
                 SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
@@ -278,7 +276,6 @@ static BOOL g_skipIntercept = NO;
                     __unsafe_unretained id msg = nil;
                     [inv getReturnValue:&msg];
                     
-                    // === 完全照搬第一版：调用 sendMessage:isRetry: ===
                     SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
                     if ([chatVC respondsToSelector:sendSel]) {
                         NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
@@ -309,7 +306,6 @@ static BOOL g_skipIntercept = NO;
 
 %end
 
-// 拦截原生 sendSound，避免重复发送
 %hook MessageDetailController
 - (void)sendSound {
     if (g_skipIntercept) {
