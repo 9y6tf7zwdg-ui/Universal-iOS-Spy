@@ -2,7 +2,11 @@
 #import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
 
-// 1. 动态获取当前 App 沙盒内的 Documents/VoicePacks/test.m4a 路径
+// 👇 解决编译报错的关键声明
+@interface MessageDetailController : UIViewController
+@end
+
+// 动态获取当前 App 沙盒内的 Documents/VoicePacks/test.m4a 路径
 static NSString *getSandboxVoicePath() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -14,7 +18,7 @@ static NSString *getSandboxVoicePath() {
     return [voiceDir stringByAppendingPathComponent:@"test.m4a"];
 }
 
-// 2. 计算音频真实时长
+// 获取音频真实时长（秒）
 static int getAudioDuration(NSString *path) {
     NSURL *url = [NSURL fileURLWithPath:path];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
@@ -24,34 +28,30 @@ static int getAudioDuration(NSString *path) {
     return (int)ceil(seconds);
 }
 
-// 3. Hook 聊天控制器，在 viewDidLoad 时注入按钮
 %hook MessageDetailController
 
 - (void)viewDidLoad {
-    %orig; // 执行原始方法
+    %orig;
     
-    // 延迟一小会儿，等原本的UI渲染完成
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // 获取底部输入栏视图
         UIView *inputBanner = [self valueForKey:@"inputBannerView"];
+        
+        // 备用方案：如果 KVC 找不到，就遍历子视图寻找输入栏
         if (!inputBanner) {
-            NSLog(@"[VoicePlugin] 没找到 inputBannerView，尝试从子视图查找");
-            // 备用方案：遍历搜索
             for (UIView *subview in self.view.subviews) {
+                // 通过类名粗略判断，或者判断高度
                 if ([subview isKindOfClass:NSClassFromString(@"HCPLPInputBannerView")] || subview.frame.size.height < 80) {
-                    inputBanner = subview; // 粗筛，真实情况可能需要按类名准确找
+                    inputBanner = subview;
                     break;
                 }
             }
         }
         
         if (inputBanner) {
-            // 防止重复添加
-            if ([inputBanner viewWithTag:9999]) return;
+            if ([inputBanner viewWithTag:9999]) return; // 防止重复添加
             
             UIButton *voiceBtn = [UIButton buttonWithType:UIButtonTypeCustom];
             voiceBtn.tag = 9999;
-            // 用一个类似语音的图标
             [voiceBtn setImage:[UIImage systemImageNamed:@"waveform"] forState:UIControlStateNormal];
             [voiceBtn setTintColor:[UIColor darkGrayColor]];
             voiceBtn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -59,20 +59,21 @@ static int getAudioDuration(NSString *path) {
             
             [inputBanner addSubview:voiceBtn];
             
-            // 自动布局：把它放在右边或者某个合适的位置（这里以放在靠右位置为例）
+            // 自动布局：放在输入栏右侧（距离右边 10 像素），你可以根据需要调整常量
             [NSLayoutConstraint activateConstraints:@[
                 [voiceBtn.centerYAnchor constraintEqualToAnchor:inputBanner.centerYAnchor],
-                [voiceBtn.rightAnchor constraintEqualToAnchor:inputBanner.rightAnchor constant:-10], // 距离右边10
+                [voiceBtn.rightAnchor constraintEqualToAnchor:inputBanner.rightAnchor constant:-10],
                 [voiceBtn.widthAnchor constraintEqualToConstant:30],
                 [voiceBtn.heightAnchor constraintEqualToConstant:30]
             ]];
             
             NSLog(@"[VoicePlugin] 按钮已成功添加到输入栏！");
+        } else {
+            NSLog(@"[VoicePlugin] 没找到 inputBannerView，请检查类名");
         }
     });
 }
 
-// 4. 新增一键发送方法
 %new
 - (void)doDirectSendVoice {
     NSString *customVoicePath = getSandboxVoicePath();
@@ -105,7 +106,7 @@ static int getAudioDuration(NSString *path) {
         __unsafe_unretained id msg = nil;
         [inv getReturnValue:&msg];
 
-        // 调用自身（MessageDetailController）的发送方法
+        // 调用自身的发送方法
         SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
         if ([self respondsToSelector:sendSel]) {
             NSMethodSignature *sendSig = [self methodSignatureForSelector:sendSel];
