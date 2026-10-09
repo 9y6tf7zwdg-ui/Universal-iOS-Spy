@@ -4,11 +4,17 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 关键修复：显式声明继承关系 =====================
+// ===================== 1. 声明必要的类 =====================
 @interface MessageDetailController : UIViewController
 @end
 
-// ===================== 沙盒路径 =====================
+// 🚨 关键修复：把列表控制器的声明提前，让后面的代码能认识它
+@interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@property (nonatomic, strong) NSMutableArray<NSString *> *files;
+@property (nonatomic, assign) UIViewController *chatVC;
+@end
+
+// ===================== 2. 沙盒路径 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -32,7 +38,7 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     return voiceFiles;
 }
 
-// ===================== 顶层控制器查找 =====================
+// ===================== 3. 顶层控制器查找 =====================
 static UIViewController *topViewController() {
     UIWindow *keyWindow = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -58,36 +64,34 @@ static UIViewController *findMessageDetailController(UIViewController *vc) {
     return nil;
 }
 
-// ===================== 音频播放器 =====================
+// ===================== 4. 音频播放器 =====================
 static AVAudioPlayer *sharedAudioPlayer = nil;
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) [sharedAudioPlayer stop];
     sharedAudioPlayer = nil;
 }
 
-// ===================== 全局变量 =====================
+// ===================== 5. 全局变量 =====================
 static NSString *g_voicePathToSend = nil;
 
-// ===================== 核心弹窗函数：无论在哪里触发，都弹出列表 =====================
+// ===================== 6. 核心弹窗函数 =====================
 static void showVoiceList() {
     UIViewController *topVC = topViewController();
     if (!topVC) return;
     
-    // 尝试找到正确的聊天控制器
     UIViewController *chatVC = findMessageDetailController(topVC);
-    if (!chatVC) chatVC = topVC; // 如果找不到，就用顶层控制器兜底
+    if (!chatVC) chatVC = topVC;
     
-    // 防止重复弹窗
     if ([topVC isKindOfClass:NSClassFromString(@"VoicePackListVC")]) return;
     
-    VoicePackListVC *listVC = [[VoicePackListVC alloc] init];
+    VoicePackListVC *listVC = [[VoicePackListVC alloc] init]; // 现在编译器认识它了
     listVC.chatVC = chatVC;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-// ===================== 拦截录音路径（发送时用） =====================
+// ===================== 7. 拦截底层录音路径与启动 =====================
 %hook CWRecorder
 - (NSString *)recordPath {
     if (g_voicePathToSend && [[NSFileManager defaultManager] fileExistsAtPath:g_voicePathToSend]) {
@@ -96,15 +100,14 @@ static void showVoiceList() {
     return %orig;
 }
 
-// 拦截底层录音启动，只要 App 试图录音，就弹出列表！
+// 一旦 App 试图启动录音，立刻拦截，弹出列表！
 - (void)beginRecordWithRecordPath:(NSString *)path {
-    // 不调用 %orig，彻底阻止录音
     NSLog(@"[VoicePlugin] 底层拦截到录音启动，弹出语音列表");
     showVoiceList();
 }
 %end
 
-// ===================== 拦截触摸事件（点击图标切换UI时用） =====================
+// ===================== 8. 拦截触摸事件 =====================
 %hook CWTalkBackView
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     NSLog(@"[VoicePlugin] 拦截到录音视图触摸，弹出语音列表");
@@ -119,7 +122,7 @@ static void showVoiceList() {
 }
 %end
 
-// ===================== 同时保留 recordSound 拦截（多重保险） =====================
+// ===================== 9. 同时保留 recordSound 拦截 =====================
 %hook MessageDetailController
 - (void)recordSound {
     NSLog(@"[VoicePlugin] 拦截到 recordSound，弹出语音列表");
@@ -127,12 +130,7 @@ static void showVoiceList() {
 }
 %end
 
-// ===================== 语音列表控制器（原生UITableViewController） =====================
-@interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
-@property (nonatomic, strong) NSMutableArray<NSString *> *files;
-@property (nonatomic, assign) UIViewController *chatVC;
-@end
-
+// ===================== 10. 语音列表控制器实现 =====================
 @implementation VoicePackListVC
 
 - (void)viewDidLoad {
