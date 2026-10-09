@@ -185,14 +185,12 @@ static void showVoiceList() {
     if (!err && sharedAudioPlayer) [sharedAudioPlayer play];
 }
 
-// ===================== 核心发送（延迟 + 直接调用 V2TIM API） =====================
+// ===================== 核心发送 =====================
 - (void)sendAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     
-    // 1. 先关闭弹窗
     [self dismissViewControllerAnimated:YES completion:^{
-        // 2. 延迟 1 秒，确保聊天界面完全稳定
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             
             UIViewController *topVC = topViewController();
@@ -205,7 +203,6 @@ static void showVoiceList() {
                 return;
             }
             
-            // 3. 提取接收者
             NSString *receiver = nil;
             @try { receiver = [chatVC valueForKey:@"friendUserId"]; } @catch (NSException *e) {}
             
@@ -216,12 +213,11 @@ static void showVoiceList() {
                 return;
             }
             
-            // 4. 转码为 M4A
             NSString *outputName = [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:outputName];
             
             AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-            int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+            __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration)); // 🚨 加 __block
             if (duration <= 0) duration = 1;
             
             AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
@@ -231,11 +227,9 @@ static void showVoiceList() {
             [session exportAsynchronouslyWithCompletionHandler:^{
                 dispatch_async(dispatch_get_main_queue(), ^{
                     
-                    // 5. 直接使用 V2TIM 官方 API 发送
                     Class v2MgrClass = NSClassFromString(@"V2TIMManager");
                     id manager = [v2MgrClass performSelector:@selector(sharedInstance)];
                     
-                    // 构造语音消息
                     SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
                     if ([manager respondsToSelector:createSel]) {
                         NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
@@ -244,13 +238,12 @@ static void showVoiceList() {
                         [inv setSelector:createSel];
                         __unsafe_unretained NSString *pathArg = outputPath;
                         [inv setArgument:&pathArg atIndex:2];
-                        [inv setArgument:&duration atIndex:3];
+                        [inv setArgument:&duration atIndex:3]; // 现在可以取地址了
                         [inv invoke];
                         
                         __unsafe_unretained id msg = nil;
                         [inv getReturnValue:&msg];
                         
-                        // 发送
                         SEL sendSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
                         if ([manager respondsToSelector:sendSel]) {
                             NSMethodSignature *sendSig = [manager methodSignatureForSelector:sendSel];
