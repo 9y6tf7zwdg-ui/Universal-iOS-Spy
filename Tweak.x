@@ -64,7 +64,8 @@ static UIViewController *topViewController() {
     UIWindow *keyWindow = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in scene.windows) {
+            // 🚨 修复报错：强制转换为 UIWindowScene
+            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
                 if (window.isKeyWindow) {
                     keyWindow = window;
                     break;
@@ -82,13 +83,13 @@ static UIViewController *topViewController() {
 
 static UIWindow *floatWindow;
 static UIButton *floatButton;
+static id floatHandler; // 🚨 修复点：用静态全局变量保存 handler，防止被 ARC 提前释放导致点不动
 
 @interface FloatHandler : NSObject
 @end
 
 @implementation FloatHandler
 
-// 拖动
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
     UIView *btn = gesture.view;
     CGPoint translation = [gesture translationInView:btn.superview];
@@ -96,7 +97,6 @@ static UIButton *floatButton;
     [gesture setTranslation:CGPointZero inView:btn.superview];
 }
 
-// 点击发送
 - (void)handleTap {
     NSLog(@"[VoicePlugin] 悬浮球被点击了！");
     
@@ -129,11 +129,9 @@ static UIButton *floatButton;
             return;
         }
         
-        // 获取真实时长（完美同步的关键）
         int duration = getAudioDuration(outputPath);
         NSLog(@"[VoicePlugin] 音频真实时长: %d秒", duration);
         
-        // 构造 V2TIM 语音消息
         Class v2ManagerClass = NSClassFromString(@"V2TIMManager");
         id manager = [v2ManagerClass performSelector:@selector(sharedInstance)];
         SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
@@ -144,7 +142,6 @@ static UIButton *floatButton;
             [inv setTarget:manager];
             [inv setSelector:createSel];
             
-            // 修复编译报错：用 __unsafe_unretained 中转
             __unsafe_unretained NSString *pathArg = outputPath;
             [inv setArgument:&pathArg atIndex:2];
             [inv setArgument:&duration atIndex:3];
@@ -153,7 +150,6 @@ static UIButton *floatButton;
             __unsafe_unretained id msg = nil;
             [inv getReturnValue:&msg];
             
-            // 触发发送
             SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
             if ([chatVC respondsToSelector:sendSel]) {
                 NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
@@ -191,7 +187,7 @@ static void createFloatUI() {
         floatWindow.rootViewController = [UIViewController new];
         floatWindow.hidden = NO;
         
-        FloatHandler *handler = [FloatHandler new];
+        floatHandler = [FloatHandler new]; // 赋值给静态全局变量
         
         floatButton = [UIButton buttonWithType:UIButtonTypeCustom];
         floatButton.frame = CGRectMake(0, 0, 60, 60);
@@ -203,18 +199,16 @@ static void createFloatUI() {
         [floatButton setTitle:@"发语音" forState:UIControlStateNormal];
         floatButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
         
-        [floatButton addTarget:handler action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
+        [floatButton addTarget:floatHandler action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
         
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:handler action:@selector(handlePan:)];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:floatHandler action:@selector(handlePan:)];
         [floatButton addGestureRecognizer:pan];
         
         [floatWindow.rootViewController.view addSubview:floatButton];
     });
 }
 
-// 插件加载入口
 __attribute__((constructor)) static void init() {
-    // 延迟 2 秒等 App 启动完毕
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         createFloatUI();
     });
