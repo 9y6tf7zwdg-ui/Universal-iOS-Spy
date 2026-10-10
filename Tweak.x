@@ -60,10 +60,7 @@ static NSString *audioInfo(NSString *path) {
                           [attrs fileSize] / 1024.0, duration];
 
     AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!track) {
-        [s appendString:@", 无音频轨道"];
-        return s;
-    }
+    if (!track) { [s appendString:@", 无音频轨道"]; return s; }
     for (id desc in track.formatDescriptions) {
         CMAudioFormatDescriptionRef fmt = (__bridge CMAudioFormatDescriptionRef)desc;
         const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
@@ -121,93 +118,97 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 强制重编码：44100Hz 立体声 → 16000Hz 单声道 =====================
-// 关键：用 AVAssetWriter 强制重新编码，避免 AVAssetExportSession 的 pass-through 行为
+// ===================== 用 AVAudioConverter 转码（iOS 10+，非常可靠） =====================
 static void convertToM4A(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
     NSError *error = nil;
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:inputPath] options:nil];
-    AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!audioTrack) {
-        addLog(@"❌ 源文件无音频轨道");
+    AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
+    if (error || !inFile) {
+        addLog(@"❌ 源文件读取失败: %@", error);
         completion(NO);
         return;
     }
 
-    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (error || !reader) {
-        addLog(@"❌ reader 创建失败: %@", error);
-        completion(NO);
-        return;
-    }
+    // 目标处理格式：16kHz 单声道 Float32
+    AVAudioFormat *outProcessingFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                                                          sampleRate:16000
+                                                                            channels:1
+                                                                         interleaved:NO];
 
-    // 读出 PCM 16bit 未压缩数据
-    NSDictionary *readerSettings = @{
-        AVFormatIDKey: @(kAudioFormatLinearPCM),
-        AVLinearPCMIsFloatKey: @NO,
-        AVLinearPCMBitDepthKey: @16,
-        AVLinearPCMIsNonInterleaved: @NO,
-        AVLinearPCMIsBigEndianKey: @NO,
-    };
-    AVAssetReaderTrackOutput *readerOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:readerSettings];
-    readerOutput.alwaysCopiesSampleData = NO;
-    if (![reader canAddOutput:readerOutput]) {
-        addLog(@"❌ 无法添加 reader output");
-        completion(NO);
-        return;
-    }
-    [reader addOutput:readerOutput];
-
-    // 写成 16kHz 单声道 AAC，这就是腾讯云 IM 期望的格式
-    NSDictionary *writerSettings = @{
+    // 输出文件设置：m4a AAC 16kHz 单声道
+    NSDictionary *outSettings = @{
         AVFormatIDKey: @(kAudioFormatMPEG4AAC),
         AVSampleRateKey: @16000,
         AVNumberOfChannelsKey: @1,
         AVEncoderBitRateKey: @32000,
     };
-    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeAppleM4A error:&error];
-    if (error || !writer) {
-        addLog(@"❌ writer 创建失败: %@", error);
+
+    AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
+                                                      settings:outSettings
+                                                  commonFormat:AVAudioPCMFormatFloat32
+                                                   interleaved:NO
+                                                         error:&error];
+    if (error || !outFile) {
+        addLog(@"❌ 输出文件创建失败: %@", error);
         completion(NO);
         return;
     }
 
-    AVAssetWriterInput *writerInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:writerSettings];
-    writerInput.expectsMediaDataInRealTime = NO;
-    if (![writer canAddInput:writerInput]) {
-        addLog(@"❌ 无法添加 writer input");
+    AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outProcessingFormat];
+    if (!converter) {
+        addLog(@"❌ Converter 创建失败");
         completion(NO);
         return;
     }
-    [writer addInput:writerInput];
 
-    [reader startReading];
-    [writer startWriting];
-    [writer startSessionAtSourceTime:kCMTimeZero];
+    AVAudioFrameCount capacity = 4096;
+    AVAudioPCMBuffer *inBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
+    AVAudioPCMBuffer *outBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outProcessingFormat frameCapacity:capacity];
 
-    dispatch_queue_t queue = dispatch_queue_create("com.voiceplugin.convert", DISPATCH_QUEUE_SERIAL);
-    [writerInput requestMediaDataWhenReadyOnQueue:queue usingBlock:^{
-        while ([writerInput isReadyForMoreMediaData]) {
-            CMSampleBufferRef buffer = [readerOutput copyNextSampleBuffer];
-            if (!buffer) {
-                [writerInput markAsFinished];
-                [writer finishWritingWithCompletionHandler:^{
-                    BOOL ok = (writer.status == AVAssetWriterStatusCompleted);
-                    if (!ok) {
-                        addLog(@"❌ writer 失败: %@", writer.error);
-                    }
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        completion(ok);
-                    });
-                }];
-                return;
+    __block BOOL inputDone = NO;
+    __block BOOL writeError = NO;
+
+    while (1) {
+        NSError *convError = nil;
+        AVAudioConverterOutputStatus outStatus = [converter convertToBuffer:outBuffer
+                                                                      error:&convError
+                                                         withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
+            if (inputDone) {
+                *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                return nil;
             }
-            [writerInput appendSampleBuffer:buffer];
-            CFRelease(buffer);
+            NSError *readError = nil;
+            [inFile readIntoBuffer:inBuffer error:&readError];
+            if (readError || inBuffer.frameLength == 0) {
+                inputDone = YES;
+                *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                return nil;
+            }
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return inBuffer;
+        }];
+
+        if (outStatus == AVAudioConverterOutputStatus_EndOfStream) break;
+        if (outStatus == AVAudioConverterOutputStatus_Error) {
+            addLog(@"❌ 转换错误: %@", convError);
+            writeError = YES;
+            break;
         }
-    }];
+
+        if (outBuffer.frameLength > 0) {
+            NSError *writeErr = nil;
+            [outFile writeFromBuffer:outBuffer error:&writeErr];
+            if (writeErr) {
+                addLog(@"❌ 写入错误: %@", writeErr);
+                writeError = YES;
+                break;
+            }
+        }
+    }
+
+    completion(!writeError);
 }
 
 // ===================== 发送 =====================
@@ -246,7 +247,6 @@ static void sendVoice(NSString *sourcePath) {
         addLog(@"📁 转码输出: %@", outputPath);
         addLog(@"📊 转码输出信息: %@", audioInfo(outputPath));
 
-        // 本地播放验证
         NSError *playErr = nil;
         AVAudioPlayer *verifyPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:outputPath] error:&playErr];
         if (playErr || !verifyPlayer) {
@@ -403,26 +403,17 @@ static void sendVoice(NSString *sourcePath) {
 
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    if (results.count == 0) {
-        addLog(@"视频选择取消");
-        return;
-    }
+    if (results.count == 0) { addLog(@"视频选择取消"); return; }
     addLog(@"选中视频，开始转码");
     PHPickerResult *result = results.firstObject;
     if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) {
-                addLog(@"加载视频失败: %@", error);
-                return;
-            }
+            if (error || !url) { addLog(@"加载视频失败: %@", error); return; }
             NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
             [fm copyItemAtPath:url.path toPath:tempPath error:&error];
-            if (error) {
-                addLog(@"复制视频失败: %@", error);
-                return;
-            }
+            if (error) { addLog(@"复制视频失败: %@", error); return; }
             NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
             convertToM4A(tempPath, destPath, ^(BOOL success) {
@@ -437,10 +428,7 @@ static void sendVoice(NSString *sourcePath) {
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    if (urls.count == 0) {
-        addLog(@"文件选择取消");
-        return;
-    }
+    if (urls.count == 0) { addLog(@"文件选择取消"); return; }
     NSURL *url = urls.firstObject;
     addLog(@"导入文件: %@", url.lastPathComponent);
     NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:url.lastPathComponent];
