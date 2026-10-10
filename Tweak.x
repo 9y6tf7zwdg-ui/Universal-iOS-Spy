@@ -4,6 +4,107 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+// ===================== 进度条 HUD =====================
+@interface ProgressHUD : UIView
+@property (nonatomic, strong) UIProgressView *progressView;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, weak) AVAssetExportSession *session;
+@property (nonatomic, weak) UIView *container;
++ (instancetype)shared;
+- (void)showOnView:(UIView *)view title:(NSString *)title;
+- (void)trackSession:(AVAssetExportSession *)session;
+- (void)updateProgress:(float)progress;
+- (void)dismiss;
+@end
+
+static ProgressHUD *g_hud = nil;
+
+@implementation ProgressHUD
+
++ (instancetype)shared {
+    if (!g_hud) {
+        g_hud = [[ProgressHUD alloc] initWithFrame:CGRectZero];
+    }
+    return g_hud;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        self.layer.cornerRadius = 12;
+
+        _titleLabel = [[UILabel alloc] init];
+        _titleLabel.textColor = [UIColor whiteColor];
+        _titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        _titleLabel.textAlignment = NSTextAlignmentCenter;
+        [self addSubview:_titleLabel];
+
+        _progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+        _progressView.progressTintColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
+        _progressView.trackTintColor = [UIColor colorWithWhite:1 alpha:0.3];
+        [self addSubview:_progressView];
+    }
+    return self;
+}
+
+- (void)showOnView:(UIView *)view title:(NSString *)title {
+    self.container = view;
+    self.titleLabel.text = title;
+    self.progressView.progress = 0;
+
+    CGFloat w = 200, h = 80;
+    self.frame = CGRectMake((view.bounds.size.width - w) / 2,
+                            (view.bounds.size.height - h) / 2,
+                            w, h);
+    self.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                            UIViewAutoresizingFlexibleRightMargin |
+                            UIViewAutoresizingFlexibleTopMargin |
+                            UIViewAutoresizingFlexibleBottomMargin;
+
+    self.titleLabel.frame = CGRectMake(10, 15, w - 20, 20);
+    self.progressView.frame = CGRectMake(20, 50, w - 40, 4);
+
+    [view addSubview:self];
+    [view bringSubviewToFront:self];
+
+    // 每 0.1 秒刷新一次进度
+    [self.timer invalidate];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+
+- (void)trackSession:(AVAssetExportSession *)session {
+    self.session = session;
+}
+
+- (void)tick {
+    if (self.session) {
+        float p = self.session.progress;
+        if (p > 0 && p <= 1.0) {
+            [self.progressView setProgress:p animated:YES];
+        }
+    }
+}
+
+- (void)updateProgress:(float)progress {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.progressView setProgress:progress animated:YES];
+    });
+}
+
+- (void)dismiss {
+    [self.timer invalidate];
+    self.timer = nil;
+    self.session = nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self removeFromSuperview];
+    });
+}
+
+@end
+
+// ===================== 基础声明 =====================
 @interface MessageDetailController : UIViewController
 @end
 
@@ -15,6 +116,7 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
 
+// ===================== 工具 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -46,26 +148,6 @@ static void addLog(NSString *format, ...) {
     }
 }
 
-static NSString *audioInfo(NSString *path) {
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    double duration = CMTimeGetSeconds(asset.duration);
-    NSMutableString *s = [NSMutableString stringWithFormat:@"大小=%.2fKB, 时长=%.2fs",
-                          [attrs fileSize] / 1024.0, duration];
-    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!track) { [s appendString:@", 无音频轨道"]; return s; }
-    for (id desc in track.formatDescriptions) {
-        CMAudioFormatDescriptionRef fmt = (__bridge CMAudioFormatDescriptionRef)desc;
-        const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
-        if (asbd) {
-            [s appendFormat:@", 采样率=%.0fHz, 声道=%u, 格式ID=%u",
-                asbd->mSampleRate, asbd->mChannelsPerFrame, (unsigned int)asbd->mFormatID];
-        }
-    }
-    return s;
-}
-
-// 🚨 过滤掉临时文件 send_，避免列表越来越长
 static NSArray<NSString *> *getAllVoiceFiles() {
     NSError *error;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:getVoicePacksDirectory() error:&error];
@@ -73,7 +155,7 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     NSMutableArray *voiceFiles = [NSMutableArray array];
     for (NSString *file in files) {
         NSString *lower = [file lowercaseString];
-        if ([lower hasPrefix:@"send_"]) continue; // 过滤掉发送时产生的临时文件
+        if ([lower hasPrefix:@"send_"]) continue;
         if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"] || [lower hasSuffix:@".aac"]) {
             [voiceFiles addObject:file];
         }
@@ -112,7 +194,7 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 转码：8000Hz 单声道 AAC =====================
+// ===================== 转码 AAC =====================
 static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -157,40 +239,45 @@ static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^compl
                 return inBuf;
             }];
 
-            if (status == AVAudioConverterOutputStatus_Error) {
-                addLog(@"❌ 转换错误: %@", convError);
-                writeError = YES;
-                break;
-            }
+            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
             if (outBuf.frameLength > 0) {
                 NSError *writeErr = nil;
                 [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) {
-                    addLog(@"❌ 写入错误: %@", writeErr);
-                    writeError = YES;
-                    break;
-                }
+                if (writeErr) { addLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
             }
             if (status == AVAudioConverterOutputStatus_EndOfStream) break;
         }
-
         outFile = nil;
         inFile = nil;
         completion(!writeError);
     }
 }
 
+// ===================== 音频剪辑 =====================
+static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval start, NSTimeInterval end, void (^completion)(BOOL success)) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
+    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    session.outputURL = [NSURL fileURLWithPath:outputPath];
+    session.outputFileType = AVFileTypeAppleM4A;
+    session.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(start, 1000), CMTimeMakeWithSeconds(end - start, 1000));
+
+    [session exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(session.status == AVAssetExportSessionStatusCompleted);
+        });
+    }];
+}
+
 // ===================== 发送 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
-    addLog(@"========== 开始发送 ==========");
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) { addLog(@"❌ 源文件不存在"); return; }
-    addLog(@"📁 源文件: %@", sourcePath);
-    addLog(@"📊 源文件信息: %@", audioInfo(sourcePath));
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) { addLog(@"❌ 无聊天控制器"); return; }
-    addLog(@"✅ 聊天控制器: %@", NSStringFromClass([chatVC class]));
+    if (!chatVC) return;
 
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
                             [NSString stringWithFormat:@"send_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]]];
@@ -200,14 +287,12 @@ static void sendVoice(NSString *sourcePath) {
     if (duration <= 0) duration = 1;
 
     convertToAAC(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) { addLog(@"❌ 转码失败"); return; }
-        addLog(@"📁 转码输出: %@", outputPath);
-        addLog(@"📊 转码输出信息: %@", audioInfo(outputPath));
+        if (!success) return;
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
         SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) { addLog(@"❌ 不支持 createSoundMessage"); return; }
+        if (![manager respondsToSelector:createSel]) return;
 
         NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
         NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -231,13 +316,8 @@ static void sendVoice(NSString *sourcePath) {
             BOOL retry = NO;
             [sendInv setArgument:&retry atIndex:3];
             [sendInv invoke];
-            addLog(@"✅ 已调用 sendMessage:isRetry:，发送完成");
         }
-
-        // 🚨 自动清理：发送成功后，删除转码产生的临时文件，避免列表越来越长
         [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
-        addLog(@"🧹 已自动清理临时文件: %@", outputPath);
-        addLog(@"========== 流程结束 ==========");
     });
 }
 
@@ -324,66 +404,101 @@ static void sendVoice(NSString *sourcePath) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSString *fileName = self.files[indexPath.row];
-    NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
-    [self dismissViewControllerAnimated:YES completion:^{ sendVoice(path); }];
+    NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:fileName message:@"请选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self dismissViewControllerAnimated:YES completion:^{ sendVoice(fullPath); }];
+    }]];
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"重命名" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self renameFile:fileName atIndexPath:indexPath];
+    }]];
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"剪辑" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self clipFile:fullPath fileName:fileName atIndexPath:indexPath];
+    }]];
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-// 🚨 滑动操作：删除 + 重命名
+- (void)renameFile:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重命名" message:@"请输入新的文件名（不包含后缀）" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.text = [fileName stringByDeletingPathExtension];
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *newName = alert.textFields.firstObject.text;
+        if (newName.length == 0) return;
+        NSString *ext = [fileName pathExtension];
+        NSString *newFileName = [newName stringByAppendingPathExtension:ext];
+        NSString *oldPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+        NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newFileName];
+        NSError *error;
+        [[NSFileManager defaultManager] moveItemAtPath:oldPath toPath:newPath error:&error];
+        if (!error) {
+            [self.files replaceObjectAtIndex:indexPath.row withObject:newFileName];
+            [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+        }
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)clipFile:(NSString *)fullPath fileName:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:fullPath] options:nil];
+    double totalDuration = CMTimeGetSeconds(asset.duration);
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"剪辑音频" message:[NSString stringWithFormat:@"原时长 %.2f 秒\n请输入剪辑时间范围（秒）", totalDuration] preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"开始时间 (如 0)";
+        textField.keyboardType = UIKeyboardTypeDecimalPad;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = [NSString stringWithFormat:@"结束时间 (如 %.1f)", totalDuration];
+        textField.keyboardType = UIKeyboardTypeDecimalPad;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        double start = [alert.textFields[0].text doubleValue];
+        double end = [alert.textFields[1].text doubleValue];
+        if (end <= start || start < 0) return;
+
+        NSString *newName = [NSString stringWithFormat:@"剪辑_%.0f_%@", [[NSDate date] timeIntervalSince1970], fileName];
+        NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
+
+        // 🚨 显示进度条
+        [[ProgressHUD shared] showOnView:self.view title:@"正在剪辑..."];
+        clipAudio(fullPath, newPath, start, end, ^(BOOL success) {
+            [[ProgressHUD shared] dismiss];
+            if (success) {
+                self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                [self.tableView reloadData];
+            }
+        });
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
 
-    // 删除
-    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
+    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithTitle:@"删除" style:UIContextualActionStyleDestructive handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认删除" message:[NSString stringWithFormat:@"确定要删除“%@”吗？", fileName] preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-            completionHandler(NO);
-        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) { completionHandler(NO); }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
             [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
             [self.files removeObjectAtIndex:indexPath.row];
             [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-            addLog(@"已删除: %@", fileName);
             completionHandler(YES);
         }]];
         [self presentViewController:alert animated:YES completion:nil];
     }];
 
-    // 重命名
-    UIContextualAction *renameAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"重命名" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重命名" message:@"请输入新的文件名（不包含后缀）" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-            textField.text = [fileName stringByDeletingPathExtension];
-        }];
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-            completionHandler(NO);
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *newName = alert.textFields.firstObject.text;
-            if (newName.length == 0) { completionHandler(NO); return; }
-
-            NSString *ext = [fileName pathExtension];
-            NSString *newFileName = [newName stringByAppendingPathExtension:ext];
-            NSString *newFullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newFileName];
-
-            NSError *error;
-            [[NSFileManager defaultManager] moveItemAtPath:fullPath toPath:newFullPath error:&error];
-            if (!error) {
-                [self.files replaceObjectAtIndex:indexPath.row withObject:newFileName];
-                [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-                addLog(@"重命名: %@ -> %@", fileName, newFileName);
-                completionHandler(YES);
-            } else {
-                completionHandler(NO);
-            }
-        }]];
-        [self presentViewController:alert animated:YES completion:nil];
-    }];
-    renameAction.backgroundColor = [UIColor systemBlueColor];
-
-    return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction, renameAction]];
+    return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
+// 🚨 视频转语音：带进度条
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -396,14 +511,50 @@ static void sendVoice(NSString *sourcePath) {
             if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
             [fm copyItemAtPath:url.path toPath:tempPath error:&error];
             if (error) return;
-            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
-            NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-            convertToAAC(tempPath, destPath, ^(BOOL success) {
-                if (success) {
-                    self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                    [self.tableView reloadData];
-                }
-            });
+
+            NSString *tempAudioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"temp_extract.m4a"];
+            if ([fm fileExistsAtPath:tempAudioPath]) [fm removeItemAtPath:tempAudioPath error:nil];
+
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tempPath] options:nil];
+            AVAssetExportSession *extractor = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+            extractor.outputURL = [NSURL fileURLWithPath:tempAudioPath];
+            extractor.outputFileType = AVFileTypeAppleM4A;
+
+            // 🚨 显示进度条并开始追踪
+            [[ProgressHUD shared] showOnView:self.view title:@"正在提取音频..."];
+            [[ProgressHUD shared] trackSession:extractor];
+
+            [extractor exportAsynchronouslyWithCompletionHandler:^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (extractor.status != AVAssetExportSessionStatusCompleted) {
+                        addLog(@"❌ 视频提取音频失败: %@", extractor.error);
+                        [[ProgressHUD shared] dismiss];
+                        return;
+                    }
+
+                    // 提取完成，进入转码阶段
+                    [[ProgressHUD shared] updateProgress:1.0];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [[ProgressHUD shared] showOnView:self.view title:@"正在转码..."];
+
+                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
+                        NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
+                        convertToAAC(tempAudioPath, destPath, ^(BOOL success) {
+                            [[ProgressHUD shared] updateProgress:1.0];
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                [[ProgressHUD shared] dismiss];
+                                if (success) {
+                                    addLog(@"✅ 视频转语音成功: %@", destName);
+                                    self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                                    [self.tableView reloadData];
+                                } else {
+                                    addLog(@"❌ 视频转语音最终转码失败");
+                                }
+                            });
+                        });
+                    });
+                });
+            }];
         }];
     }
 }
