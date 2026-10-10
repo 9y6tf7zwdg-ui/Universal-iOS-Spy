@@ -4,7 +4,7 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 简化版进度弹窗（菊花 + 文字） =====================
+// ===================== 进度弹窗 =====================
 @interface NativeProgressVC : UIViewController
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UILabel *titleLabel;
@@ -130,67 +130,61 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 转码 1：发送用 8000Hz AAC（黄金版本，绝不改动） =====================
-static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
-
-    @autoreleasepool {
-        NSError *error = nil;
-        AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
-        if (error || !inFile) { addLog(@"❌ 读取源文件失败: %@", error); completion(NO); return; }
-
-        NSDictionary *outSettings = @{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @8000,
-            AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: @16000,
-        };
-
-        AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
-                                                          settings:outSettings
-                                                     commonFormat:AVAudioPCMFormatInt16
-                                                      interleaved:NO
-                                                            error:&error];
-        if (error || !outFile) { addLog(@"❌ 创建输出文件失败: %@", error); completion(NO); return; }
-
-        AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outFile.processingFormat];
-        if (!converter) { addLog(@"❌ Converter 创建失败"); outFile = nil; completion(NO); return; }
-
-        AVAudioFrameCount capacity = 4096;
-        AVAudioPCMBuffer *inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
-        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFile.processingFormat frameCapacity:capacity];
-
-        BOOL writeError = NO;
-        int safety = 0;
-        while (1) {
-            if (++safety > 500000) { addLog(@"⚠️ AAC 循环保护"); break; }
-            NSError *convError = nil;
-            AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf error:&convError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
-                NSError *readError = nil;
-                [inFile readIntoBuffer:inBuf error:&readError];
-                if (readError || inBuf.frameLength == 0) {
-                    *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                    return nil;
-                }
-                *outStatus = AVAudioConverterInputStatus_HaveData;
-                return inBuf;
-            }];
-            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ AAC 转换错误: %@", convError); writeError = YES; break; }
-            if (outBuf.frameLength > 0) {
-                NSError *writeErr = nil;
-                [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { addLog(@"❌ AAC 写入错误: %@", writeErr); writeError = YES; break; }
-            }
-            if (status == AVAudioConverterOutputStatus_EndOfStream) break;
-        }
-        outFile = nil;
-        inFile = nil;
-        completion(!writeError);
+// ===================== 发送：直接发源文件，不转码 =====================
+// 早上好.wav / 叫.wav / 叫床.wav 这些源文件本身就能被 IM 接受，
+// 所以不做任何转码，直接构造消息发出。
+static void sendVoice(NSString *sourcePath) {
+    stopPlayingAudio();
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
+        addLog(@"❌ 源文件不存在");
+        return;
     }
+
+    UIViewController *chatVC = findMessageDetailController(topViewController());
+    if (!chatVC) {
+        addLog(@"❌ 无聊天控制器");
+        return;
+    }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
+    int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
+    if (duration <= 0) duration = 1;
+
+    addLog(@"📤 直接发送源文件: %@, 时长: %d秒", sourcePath.lastPathComponent, duration);
+
+    Class v2Mgr = NSClassFromString(@"V2TIMManager");
+    id manager = [v2Mgr performSelector:@selector(sharedInstance)];
+    SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+    if (![manager respondsToSelector:createSel]) { addLog(@"❌ 不支持 createSoundMessage"); return; }
+
+    NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:manager];
+    [inv setSelector:createSel];
+    __unsafe_unretained NSString *pathArg = sourcePath;
+    [inv setArgument:&pathArg atIndex:2];
+    [inv setArgument:&duration atIndex:3];
+    [inv invoke];
+
+    __unsafe_unretained id msg = nil;
+    [inv getReturnValue:&msg];
+    addLog(@"✅ 消息构造: %@", msg ? @"成功" : @"失败");
+
+    SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
+    if (![chatVC respondsToSelector:sendSel]) { addLog(@"❌ 无 sendMessage:isRetry:"); return; }
+
+    NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+    NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+    [sendInv setTarget:chatVC];
+    [sendInv setSelector:sendSel];
+    [sendInv setArgument:&msg atIndex:2];
+    BOOL retry = NO;
+    [sendInv setArgument:&retry atIndex:3];
+    [sendInv invoke];
+    addLog(@"✅ 发送完成");
 }
 
-// ===================== 转码 2：视频转语音输出 16000Hz WAV =====================
+// ===================== 视频转语音：16000Hz WAV（和 早上好.wav 一致） =====================
 static void convertToWAV(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -200,6 +194,7 @@ static void convertToWAV(NSString *inputPath, NSString *outputPath, void (^compl
         AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
         if (error || !inFile) { addLog(@"❌ 读取源文件失败: %@", error); completion(NO); return; }
 
+        // 16kHz 单声道 16bit PCM WAV（和早上好.wav 完全一致）
         NSDictionary *wavSettings = @{
             AVFormatIDKey: @(kAudioFormatLinearPCM),
             AVSampleRateKey: @16000,
@@ -227,7 +222,7 @@ static void convertToWAV(NSString *inputPath, NSString *outputPath, void (^compl
         BOOL writeError = NO;
         int safety = 0;
         while (1) {
-            if (++safety > 500000) { addLog(@"⚠️ WAV 循环保护"); break; }
+            if (++safety > 500000) { addLog(@"⚠️ 循环保护"); break; }
             NSError *convError = nil;
             AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf error:&convError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
                 NSError *readError = nil;
@@ -239,11 +234,11 @@ static void convertToWAV(NSString *inputPath, NSString *outputPath, void (^compl
                 *outStatus = AVAudioConverterInputStatus_HaveData;
                 return inBuf;
             }];
-            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ WAV 转换错误: %@", convError); writeError = YES; break; }
+            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
             if (outBuf.frameLength > 0) {
                 NSError *writeErr = nil;
                 [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { addLog(@"❌ WAV 写入错误: %@", writeErr); writeError = YES; break; }
+                if (writeErr) { addLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
             }
             if (status == AVAudioConverterOutputStatus_EndOfStream) break;
         }
@@ -269,56 +264,6 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
             completion(session.status == AVAssetExportSessionStatusCompleted);
         });
     }];
-}
-
-// ===================== 发送：用 8000Hz AAC（黄金版本，逻辑不变） =====================
-static void sendVoice(NSString *sourcePath) {
-    stopPlayingAudio();
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
-
-    UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) return;
-
-    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"send_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]]];
-
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
-    __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
-    if (duration <= 0) duration = 1;
-
-    convertToAAC(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) { addLog(@"❌ 发送转码失败"); return; }
-
-        Class v2Mgr = NSClassFromString(@"V2TIMManager");
-        id manager = [v2Mgr performSelector:@selector(sharedInstance)];
-        SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) return;
-
-        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        [inv setTarget:manager];
-        [inv setSelector:createSel];
-        __unsafe_unretained NSString *pathArg = outputPath;
-        [inv setArgument:&pathArg atIndex:2];
-        [inv setArgument:&duration atIndex:3];
-        [inv invoke];
-
-        __unsafe_unretained id msg = nil;
-        [inv getReturnValue:&msg];
-
-        SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if ([chatVC respondsToSelector:sendSel]) {
-            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-            [sendInv setTarget:chatVC];
-            [sendInv setSelector:sendSel];
-            [sendInv setArgument:&msg atIndex:2];
-            BOOL retry = NO;
-            [sendInv setArgument:&retry atIndex:3];
-            [sendInv invoke];
-        }
-        [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
-    });
 }
 
 // ===================== 列表 =====================
@@ -541,14 +486,11 @@ static void sendVoice(NSString *sourcePath) {
             UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"视频转语音" message:nil preferredStyle:UIAlertControllerStyleAlert];
             [progressAlert setValue:vc forKey:@"contentViewController"];
 
-            // 🚨 关键：加"取消"按钮，用户可以随时退出
             __block AVAssetExportSession *cancellableExtractor = nil;
             __block BOOL cancelled = NO;
             [progressAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
                 cancelled = YES;
                 [cancellableExtractor cancelExport];
-                [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
-                [[NSFileManager defaultManager] removeItemAtPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"temp_extract.m4a"] error:nil];
             }]];
             [self presentViewController:progressAlert animated:YES completion:nil];
 
@@ -565,7 +507,7 @@ static void sendVoice(NSString *sourcePath) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (cancelled) return;
                     if (extractor.status != AVAssetExportSessionStatusCompleted) {
-                        addLog(@"❌ 视频提取音频失败: %@", extractor.error);
+                        addLog(@"❌ 视频提取失败: %@", extractor.error);
                         [progressAlert dismissViewControllerAnimated:YES completion:nil];
                         return;
                     }
@@ -578,7 +520,6 @@ static void sendVoice(NSString *sourcePath) {
                         NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.wav", (long)[[NSDate date] timeIntervalSince1970]];
                         NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
-                        // 转换放到后台线程，避免卡 UI
                         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                             convertToWAV(tempAudioPath, destPath, ^(BOOL success) {
                                 dispatch_async(dispatch_get_main_queue(), ^{
