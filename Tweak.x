@@ -456,3 +456,34 @@ static void sendVoice(NSString *sourcePath) {
     [topViewController() presentViewController:nav animated:YES completion:nil];
 }
 %end
+
+// ===================== 新增：监测原生录音路径 =====================
+%hook V2TIMManager
+
+- (id)createSoundMessage:(NSString *)soundPath duration:(int)duration {
+    // 1. 构造要写入的日志内容
+    NSString *logMsg = [NSString stringWithFormat:@"\n=== 🎯 拦截到 createSoundMessage ===\n路径: %@\n时长: %d 秒\n==============================\n", soundPath, duration];
+    
+    // 2. 定位到沙盒路径
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
+    NSString *logPath = [voiceDir stringByAppendingPathComponent:@"path_tracker.log"];
+    
+    // 3. 确保目录存在
+    [[NSFileManager defaultManager] createDirectoryAtPath:voiceDir withIntermediateDirectories:YES attributes:nil error:nil];
+    
+    // 4. 追加写入日志
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:logPath]) {
+        [logMsg writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        [fh seekToEndOfFile];
+        [fh writeData:[logMsg dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+    
+    // 5. 原封不动放行，绝不干扰 App 原有逻辑
+    return %orig;
+}
+%end
