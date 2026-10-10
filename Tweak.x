@@ -30,74 +30,64 @@ static void traceLog(NSString *format, ...) {
     }
 }
 
-// ===================== Hook：聊天界面发送按钮 =====================
-%hook MessageDetailController
-
-- (void)sendSound {
-    traceLog(@"触发原生 sendSound，不干预");
-    %orig;
+static void dumpHex(NSString *filePath) {
+    NSData *data = [NSData dataWithContentsOfFile:filePath];
+    if (!data) return;
+    NSUInteger len = MIN(data.length, 32);
+    NSMutableString *hex = [NSMutableString string];
+    for (int i = 0; i < len; i++) {
+        [hex appendFormat:@"%02X ", ((const unsigned char *)data.bytes)[i]];
+    }
+    traceLog(@"🔍 文件头(前%lu字节): %@", (unsigned long)len, hex);
 }
 
-- (void)sendMessage:(id)msg isRetry:(BOOL)retry {
-    traceLog(@"触发原生 sendMessage:isRetry:，不干预");
-    %orig;
-}
-
-%end
-
-// ===================== 我们的纯诊断测试 =====================
+// ===================== Hook =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
-    // 1. 寻找源文件（这里我们直接找用户放在 VoicePacks 里的 早上好.wav）
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *sourcePath = [docPath stringByAppendingPathComponent:@"VoicePacks/早上好.wav"];
     
-    traceLog(@"\n========== 🧪 开始转码测试 ==========");
-    traceLog(@"源文件路径: %@", sourcePath);
-    
+    traceLog(@"\n========== 🧪 开始 M4A 导出测试 ==========");
     if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        traceLog(@"❌ 源文件不存在，请把 早上好.wav 放进 VoicePacks 目录");
+        traceLog(@"❌ 源文件不存在");
         return %orig;
     }
     
-    // 2. 设定输出路径为系统原生认可的 AAC 路径（弄成 m4a 再改后缀）
-    NSString *outputPath = [docPath stringByAppendingPathComponent:@"VoicePacks/test_export.aac"];
-    [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
+    NSString *m4aPath = [docPath stringByAppendingPathComponent:@"VoicePacks/test_export.m4a"];
+    [[NSFileManager defaultManager] removeItemAtPath:m4aPath error:nil];
     
-    // 3. 使用 AVAssetExportSession 进行标准转码
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-    exportSession.outputURL = [NSURL fileURLWithPath:outputPath];
+    exportSession.outputURL = [NSURL fileURLWithPath:m4aPath];
     exportSession.outputFileType = AVFileTypeAppleM4A;
     
-    traceLog(@"开始导出为 M4A...");
     [exportSession exportAsynchronouslyWithCompletionHandler:^{
         dispatch_async(dispatch_get_main_queue(), ^{
             traceLog(@"导出状态: %ld", (long)exportSession.status);
             if (exportSession.status == AVAssetExportSessionStatusCompleted) {
-                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-                traceLog(@"✅ 导出成功! 文件大小: %llu 字节", [attrs fileSize]);
-                traceLog(@"文件路径: %@", outputPath);
+                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:m4aPath error:nil];
+                traceLog(@"✅ M4A 导出成功! 文件大小: %llu 字节", [attrs fileSize]);
+                dumpHex(m4aPath);
                 
-                // 读取前 32 字节，看是否是标准 M4A 容器
-                NSData *data = [NSData dataWithContentsOfFile:outputPath];
-                NSMutableString *hex = [NSMutableString string];
-                for (int i = 0; i < 32 && i < data.length; i++) {
-                    [hex appendFormat:@"%02X ", ((const unsigned char *)data.bytes)[i]];
-                }
-                traceLog(@"🔍 M4A 文件头(前32字节): %@", hex);
-                
-                // 现在，我们可以尝试用原生录音目录的格式来发送这个文件！
-                // （这里只写日志，不实际发送，保证诊断纯度）
-                traceLog(@"✅ 诊断完成，等待下一步指令");
-                
+                // 模拟插件流程：把 m4a 重命名为 aac，看看腾讯云能不能认
+                NSString *renamedPath = [docPath stringByAppendingPathComponent:@"VoicePacks/test_export_renamed.aac"];
+                [[NSFileManager defaultManager] removeItemAtPath:renamedPath error:nil];
+                [[NSFileManager defaultManager] moveItemAtPath:m4aPath toPath:renamedPath error:nil];
+                traceLog(@"🔁 已重命名为 .aac，准备后续发送测试");
             } else {
                 traceLog(@"❌ 导出失败: %@", exportSession.error);
             }
         });
     }];
-    
-    // 不调用 %orig，阻止原有录音逻辑
+}
+
+%end
+
+// 保留最简拦截，不干预
+%hook V2TIMManager
+- (id)createSoundMessage:(NSString *)soundPath duration:(int)duration {
+    traceLog(@"🎯 拦截原生 createSoundMessage: %@", soundPath.lastPathComponent);
+    return %orig;
 }
 %end
