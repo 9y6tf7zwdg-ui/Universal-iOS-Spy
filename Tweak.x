@@ -4,15 +4,13 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// 声明我们拦截的类
 @interface MessageDetailController : UIViewController
 @end
 
 @interface CWTalkBackView : UIView
-- (void)sendRecorde:(id)sender;   // 松手发送的时刻
+- (void)sendRecorde:(id)sender;
 @end
 
-// 语音列表
 @interface VoicePackListVC : UITableViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
@@ -71,16 +69,87 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
+// ===================== 精准转码：输出 16kHz 单声道 AAC =====================
+// 腾讯云 IM 推荐音频格式。用 AVAssetWriter 精确控制输出参数，
+// 避免 AVAssetExportSession 沿用视频原始音轨的采样率导致无法播放。
+static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+
+    NSURL *inputURL = [NSURL fileURLWithPath:inputPath];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inputURL options:nil];
+    AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!audioTrack) {
+        NSLog(@"[VoicePlugin] 源文件没有音频轨道");
+        completion(NO);
+        return;
+    }
+
+    NSError *error = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (error || !reader) { completion(NO); return; }
+
+    // 读取为 PCM 16bit
+    NSDictionary *readerSettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVLinearPCMIsFloatKey: @NO,
+        AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsNonInterleaved: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+    };
+    AVAssetReaderTrackOutput *readerOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:readerSettings];
+    readerOutput.alwaysCopiesSampleData = NO;
+    if (![reader canAddOutput:readerOutput]) { completion(NO); return; }
+    [reader addOutput:readerOutput];
+
+    // 输出为 16kHz 单声道 AAC
+    NSDictionary *writerSettings = @{
+        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey: @16000,
+        AVNumberOfChannelsKey: @1,
+        AVEncoderBitRateKey: @32000,
+    };
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeAppleM4A error:&error];
+    if (error || !writer) { completion(NO); return; }
+
+    AVAssetWriterInput *writerInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:writerSettings];
+    writerInput.expectsMediaDataInRealTime = NO;
+    if (![writer canAddInput:writerInput]) { completion(NO); return; }
+    [writer addInput:writerInput];
+
+    [reader startReading];
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    dispatch_queue_t queue = dispatch_queue_create("com.voiceplugin.convert", DISPATCH_QUEUE_SERIAL);
+    [writerInput requestMediaDataWhenReadyOnQueue:queue usingBlock:^{
+        while ([writerInput isReadyForMoreMediaData]) {
+            CMSampleBufferRef buffer = [readerOutput copyNextSampleBuffer];
+            if (!buffer) {
+                [writerInput markAsFinished];
+                [writer finishWritingWithCompletionHandler:^{
+                    BOOL ok = (writer.status == AVAssetWriterStatusCompleted);
+                    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
+                    NSLog(@"[VoicePlugin] 转码结果: %@, 文件大小: %llu 字节", ok ? @"成功" : @"失败", [attrs fileSize]);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        completion(ok);
+                    });
+                }];
+                return;
+            }
+            [writerInput appendSampleBuffer:buffer];
+            CFRelease(buffer);
+        }
+    }];
+}
+
 // ===================== 发送核心 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) {
-        NSLog(@"[VoicePlugin] 找不到聊天控制器");
-        return;
-    }
+    if (!chatVC) { NSLog(@"[VoicePlugin] 找不到聊天控制器"); return; }
 
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
 
@@ -88,50 +157,43 @@ static void sendVoice(NSString *sourcePath) {
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
 
-    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-    session.outputURL = [NSURL fileURLWithPath:outputPath];
-    session.outputFileType = AVFileTypeAppleM4A;
+    convertToIMAudio(sourcePath, outputPath, ^(BOOL success) {
+        if (!success) {
+            NSLog(@"[VoicePlugin] 转码失败");
+            return;
+        }
+        NSLog(@"[VoicePlugin] 转码完成: %@ (%d秒)", outputPath, duration);
 
-    [session exportAsynchronouslyWithCompletionHandler:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-            if (session.status != AVAssetExportSessionStatusCompleted || !attrs || [attrs fileSize] == 0) {
-                NSLog(@"[VoicePlugin] 转码失败");
-                return;
-            }
-            NSLog(@"[VoicePlugin] 转码完成: %@ (%d秒)", outputPath, duration);
+        Class v2Mgr = NSClassFromString(@"V2TIMManager");
+        id manager = [v2Mgr performSelector:@selector(sharedInstance)];
+        SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+        if (![manager respondsToSelector:createSel]) return;
 
-            Class v2Mgr = NSClassFromString(@"V2TIMManager");
-            id manager = [v2Mgr performSelector:@selector(sharedInstance)];
-            SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-            if (![manager respondsToSelector:createSel]) return;
+        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv setTarget:manager];
+        [inv setSelector:createSel];
+        __unsafe_unretained NSString *pathArg = outputPath;
+        [inv setArgument:&pathArg atIndex:2];
+        [inv setArgument:&duration atIndex:3];
+        [inv invoke];
 
-            NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            [inv setTarget:manager];
-            [inv setSelector:createSel];
-            __unsafe_unretained NSString *pathArg = outputPath;
-            [inv setArgument:&pathArg atIndex:2];
-            [inv setArgument:&duration atIndex:3];
-            [inv invoke];
+        __unsafe_unretained id msg = nil;
+        [inv getReturnValue:&msg];
 
-            __unsafe_unretained id msg = nil;
-            [inv getReturnValue:&msg];
-
-            SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-            if ([chatVC respondsToSelector:sendSel]) {
-                NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-                NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-                [sendInv setTarget:chatVC];
-                [sendInv setSelector:sendSel];
-                [sendInv setArgument:&msg atIndex:2];
-                BOOL retry = NO;
-                [sendInv setArgument:&retry atIndex:3];
-                [sendInv invoke];
-                NSLog(@"[VoicePlugin] 发送指令已执行");
-            }
-        });
-    }];
+        SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
+        if ([chatVC respondsToSelector:sendSel]) {
+            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+            [sendInv setTarget:chatVC];
+            [sendInv setSelector:sendSel];
+            [sendInv setArgument:&msg atIndex:2];
+            BOOL retry = NO;
+            [sendInv setArgument:&retry atIndex:3];
+            [sendInv invoke];
+            NSLog(@"[VoicePlugin] 发送指令已执行");
+        }
+    });
 }
 
 // ===================== 语音列表 =====================
@@ -188,7 +250,6 @@ static void sendVoice(NSString *sourcePath) {
 
     UIButton *playBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     playBtn.frame = CGRectMake(0, 5, 40, 30);
-    [playBtn setImage:[UIImage imageNamed:@"play.circle.fill"] forState:UIControlStateNormal];
     if (@available(iOS 13.0, *)) [playBtn setImage:[UIImage systemImageNamed:@"play.circle.fill"] forState:UIControlStateNormal];
     playBtn.tag = indexPath.row;
     [playBtn addTarget:self action:@selector(playAction:) forControlEvents:UIControlEventTouchUpInside];
@@ -244,18 +305,12 @@ static void sendVoice(NSString *sourcePath) {
             if (error) return;
             NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tempPath] options:nil];
-            AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-            session.outputURL = [NSURL fileURLWithPath:destPath];
-            session.outputFileType = AVFileTypeAppleM4A;
-            [session exportAsynchronouslyWithCompletionHandler:^{
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (session.status == AVAssetExportSessionStatusCompleted) {
-                        self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                        [self.tableView reloadData];
-                    }
-                });
-            }];
+            convertToIMAudio(tempPath, destPath, ^(BOOL success) {
+                if (success) {
+                    self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                    [self.tableView reloadData];
+                }
+            });
         }];
     }
 }
@@ -276,9 +331,6 @@ static void sendVoice(NSString *sourcePath) {
 @end
 
 // ===================== 方案 C 核心 =====================
-// 松手时，App 会调用 CWTalkBackView 的 sendRecorde:
-// 我们拦截它，不调用 %orig，弹出列表让用户选择
-
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
