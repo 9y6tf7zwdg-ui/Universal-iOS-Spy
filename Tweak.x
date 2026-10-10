@@ -1,13 +1,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 
 // ===================== 日志 =====================
 static NSString *getLogPath() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *dir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [dir stringByAppendingPathComponent:@"final_fix_test.log"];
+    return [dir stringByAppendingPathComponent:@"final_adts_test.log"];
 }
 
 static void traceLog(NSString *format, ...) {
@@ -56,71 +57,101 @@ static UIViewController *topViewController() {
     return topVC;
 }
 
-// ===================== 核心：转码为 8000Hz 单声道 M4A =====================
-static void transcodeToM4A(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+// ===================== 终极核心：生成带 ADTS 头的 8000Hz 单声道 AAC =====================
+static void convertToADTSAAC(NSString *sourcePath, NSString *outputPath, void (^completion)(BOOL success)) {
+    // 1. 打开输入文件（早上好.wav）
+    ExtAudioFileRef inFile = NULL;
+    OSStatus status = ExtAudioFileOpenURL((__bridge CFURLRef)[NSURL fileURLWithPath:sourcePath], &inFile);
+    if (status != noErr) {
+        traceLog(@"❌ 无法打开输入文件: %d", (int)status);
+        completion(NO);
+        return;
+    }
 
-    @autoreleasepool {
-        NSError *error = nil;
-        AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
-        if (error || !inFile) { traceLog(@"❌ 读取源文件失败: %@", error); completion(NO); return; }
+    // 2. 设定输入文件的客户端格式（PCM 16kHz 单声道 16bit）
+    AudioStreamBasicDescription clientFormat = {0};
+    clientFormat.mSampleRate = 16000;
+    clientFormat.mFormatID = kAudioFormatLinearPCM;
+    clientFormat.mFormatFlags = kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    clientFormat.mBytesPerPacket = 2;
+    clientFormat.mFramesPerPacket = 1;
+    clientFormat.mBytesPerFrame = 2;
+    clientFormat.mChannelsPerFrame = 1;
+    clientFormat.mBitsPerChannel = 16;
+    
+    status = ExtAudioFileSetProperty(inFile, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFormat), &clientFormat);
+    if (status != noErr) {
+        traceLog(@"❌ 设定输入格式失败: %d", (int)status);
+        ExtAudioFileDispose(inFile);
+        completion(NO);
+        return;
+    }
 
-        // 🚨 关键：指定 8000Hz 单声道 AAC
-        NSDictionary *outSettings = @{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @8000,
-            AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: @16000,
-        };
+    // 3. 创建输出文件（ADTS AAC 8kHz 单声道）
+    AudioStreamBasicDescription outFormat = {0};
+    outFormat.mSampleRate = 8000;
+    outFormat.mFormatID = kAudioFormatMPEG4AAC;
+    outFormat.mChannelsPerFrame = 1;
+    outFormat.mBytesPerPacket = 0;
+    outFormat.mFramesPerPacket = 1024; // ADTS 帧大小
+    outFormat.mBytesPerFrame = 0;
+    outFormat.mBitsPerChannel = 0;
+    
+    ExtAudioFileRef outFile = NULL;
+    status = ExtAudioFileCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:outputPath], kAudioFileAAC_ADTSType, &outFormat, NULL, kAudioFileFlags_EraseFile, &outFile);
+    if (status != noErr) {
+        traceLog(@"❌ 创建输出文件失败: %d", (int)status);
+        ExtAudioFileDispose(inFile);
+        completion(NO);
+        return;
+    }
 
-        // 🚨 关键：扩展名是 .m4a，让 AVAudioFile 写入标准容器
-        AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
-                                                          settings:outSettings
-                                                     commonFormat:AVAudioPCMFormatInt16
-                                                      interleaved:NO
-                                                            error:&error];
-        if (error || !outFile) { traceLog(@"❌ 创建 M4A 失败: %@", error); completion(NO); return; }
+    // 4. 设定输出文件的客户端格式（我们往里面写 PCM 数据）
+    status = ExtAudioFileSetProperty(outFile, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFormat), &clientFormat);
+    if (status != noErr) {
+        traceLog(@"❌ 设定输出格式失败: %d", (int)status);
+        ExtAudioFileDispose(inFile);
+        ExtAudioFileDispose(outFile);
+        completion(NO);
+        return;
+    }
 
-        AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outFile.processingFormat];
-        if (!converter) { traceLog(@"❌ Converter 失败"); completion(NO); return; }
+    // 5. 循环读取 PCM 并写入 AAC
+    UInt32 bufferByteSize = 4096;
+    void *buffer = malloc(bufferByteSize);
+    AudioBufferList bufferList;
+    bufferList.mNumberBuffers = 1;
+    bufferList.mBuffers[0].mNumberChannels = clientFormat.mChannelsPerFrame;
+    bufferList.mBuffers[0].mDataByteSize = bufferByteSize;
+    bufferList.mBuffers[0].mData = buffer;
 
-        AVAudioFrameCount capacity = 4096;
-        AVAudioPCMBuffer *inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
-        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFile.processingFormat frameCapacity:capacity];
+    UInt32 numFrames = bufferByteSize / clientFormat.mBytesPerFrame;
+    BOOL success = YES;
+    while (1) {
+        status = ExtAudioFileRead(inFile, &numFrames, &bufferList);
+        if (status != noErr) { success = NO; break; }
+        if (numFrames == 0) { break; } // 读完
+        
+        status = ExtAudioFileWrite(outFile, numFrames, &bufferList);
+        if (status != noErr) { success = NO; break; }
+    }
 
-        BOOL writeError = NO;
-        int safety = 0;
-        while (1) {
-            if (++safety > 500000) { traceLog(@"⚠️ 循环保护"); break; }
-            NSError *convError = nil;
-            AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf error:&convError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
-                NSError *readError = nil;
-                [inFile readIntoBuffer:inBuf error:&readError];
-                if (readError || inBuf.frameLength == 0) {
-                    *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                    return nil;
-                }
-                *outStatus = AVAudioConverterInputStatus_HaveData;
-                return inBuf;
-            }];
-            if (status == AVAudioConverterOutputStatus_Error) { traceLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
-            if (outBuf.frameLength > 0) {
-                NSError *writeErr = nil;
-                [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { traceLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
-            }
-            if (status == AVAudioConverterOutputStatus_EndOfStream) break;
-        }
-        outFile = nil;
-        inFile = nil;
-        completion(!writeError);
+    free(buffer);
+    ExtAudioFileDispose(inFile);
+    ExtAudioFileDispose(outFile);
+
+    if (success) {
+        traceLog(@"✅ ADTS AAC 转换成功");
+        completion(YES);
+    } else {
+        traceLog(@"❌ ADTS AAC 转换失败，错误码: %d", (int)status);
+        completion(NO);
     }
 }
 
 // ===================== 终极发送函数 =====================
 static void testSendFinal(NSString *sourcePath) {
-    traceLog(@"\n========== 🚀 终极发送测试 (M4A 转 AAC) ==========");
+    traceLog(@"\n========== 🚀 终极发送测试 (纯正 ADTS AAC) ==========");
     if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
         traceLog(@"❌ 源文件不存在");
         return;
@@ -131,22 +162,13 @@ static void testSendFinal(NSString *sourcePath) {
     [[NSFileManager defaultManager] createDirectoryAtPath:hcrDir withIntermediateDirectories:YES attributes:nil error:nil];
 
     NSString *uuid = [[NSUUID UUID] UUIDString];
-    NSString *tempM4aPath = [hcrDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.m4a", uuid]];
     NSString *finalAacPath = [hcrDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.aac", uuid]];
 
-    transcodeToM4A(sourcePath, tempM4aPath, ^(BOOL success) {
+    convertToADTSAAC(sourcePath, finalAacPath, ^(BOOL success) {
         if (!success) return;
         
-        // 重命名为 .aac（腾讯云 IM 偏好该后缀）
-        NSError *moveErr = nil;
-        [[NSFileManager defaultManager] moveItemAtPath:tempM4aPath toPath:finalAacPath error:&moveErr];
-        if (moveErr) {
-            traceLog(@"❌ 重命名失败: %@", moveErr);
-            return;
-        }
-
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:finalAacPath error:nil];
-        traceLog(@"✅ 转码+重命名完成。文件大小: %llu 字节", [attrs fileSize]);
+        traceLog(@"✅ 转换完成。文件大小: %llu 字节", [attrs fileSize]);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *chatVC = findMessageDetailController(topViewController());
