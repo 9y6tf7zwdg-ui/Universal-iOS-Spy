@@ -255,8 +255,8 @@ static void sendVoice(NSString *sourcePath) {
     self.navigationController.toolbarHidden = NO;
     UIBarButtonItem *videoBtn = [[UIBarButtonItem alloc] initWithTitle:@"视频转语音" style:UIBarButtonItemStylePlain target:self action:@selector(videoAction)];
     UIBarButtonItem *importBtn = [[UIBarButtonItem alloc] initWithTitle:@"导入语音包" style:UIBarButtonItemStylePlain target:self action:@selector(importAction)];
-    UIBarButtonItem *space1 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleFlexibleSpace target:nil action:nil];
-    UIBarButtonItem *space2 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *space1 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *space2 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
     self.toolbarItems = @[videoBtn, space1, importBtn, space2];
 }
 
@@ -306,7 +306,7 @@ static void sendVoice(NSString *sourcePath) {
     return cell;
 }
 
-// 🚨 这里加入了极详尽的诊断日志，专门排查为什么试听没声音
+// 🚨 这里加入了极详尽的诊断日志
 - (void)playAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
@@ -330,7 +330,6 @@ static void sendVoice(NSString *sourcePath) {
     // 检查 AVAudioSession 当前状态
     AVAudioSession *session = [AVAudioSession sharedInstance];
     addLog(@"🔊 音频会话类别: %@", session.category);
-    addLog(@"🔊 音频会话是否活跃: %@", session.isActive ? @"YES" : @"NO");
     addLog(@"🔊 音频会话采样率: %.2f", session.sampleRate);
     addLog(@"🔊 音频会话输出声道数: %lu", (unsigned long)session.outputNumberOfChannels);
     addLog(@"🔊 当前输出设备: %@", session.currentRoute.outputs.firstObject.portName ?: @"未知");
@@ -357,7 +356,6 @@ static void sendVoice(NSString *sourcePath) {
     BOOL playResult = [sharedAudioPlayer play];
     addLog(@"▶️ play 方法返回: %@", playResult ? @"YES" : @"NO");
 
-    // 延迟检查是否真的在播放
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         addLog(@"⏱️ 1秒后检查播放器状态 - isPlaying: %@, currentTime: %.2f", sharedAudioPlayer.isPlaying ? @"YES" : @"NO", sharedAudioPlayer.currentTime);
     });
@@ -373,9 +371,9 @@ static void sendVoice(NSString *sourcePath) {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
 
-    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
+    UIContextualAction *deleteAction = [UIContextualAlertAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认删除" message:[NSString stringWithFormat:@"确定要删除“%@”吗？", fileName] preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) { completionHandler(NO); }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAction * _Nonnull action) { completionHandler(NO); }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
             [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
             [self.files removeObjectAtIndex:indexPath.row];
