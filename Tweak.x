@@ -45,14 +45,12 @@
     self.trackingReader = reader;
     self.trackingAsset = asset;
     [self.timer invalidate];
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(tick) self userInfo:nil repeats:YES];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 
 - (void)tick {
     @try {
         if (self.trackingReader && self.trackingReader.status == AVAssetReaderStatusReading) {
-            // 通过 reader 状态估算进度（无精确 API，退化为"活动指示"）
-            // 这里用 indeterminate 表示"在处理"，不做精确进度
             [self.progressView setProgress:0.5 animated:YES];
         }
     } @catch (NSException *e) {}
@@ -507,7 +505,6 @@ static void sendVoice(NSString *sourcePath) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-// 剪辑：剪出 m4a → 一步转成 16000Hz WAV
 - (void)clipFile:(NSString *)fullPath fileName:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:fullPath] options:nil];
     double totalDuration = CMTimeGetSeconds(asset.duration);
@@ -603,7 +600,6 @@ static void sendVoice(NSString *sourcePath) {
             [progressAlert setValue:vc forKey:@"contentViewController"];
             [self presentViewController:progressAlert animated:YES completion:nil];
 
-            // 显示一个菊花表示正在处理
             UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
             spinner.frame = CGRectMake(125, 60, 20, 20);
             [vc.view addSubview:spinner];
@@ -612,7 +608,7 @@ static void sendVoice(NSString *sourcePath) {
             NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.wav", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
-            // 🚨 关键：一步转换，直接读视频的音频轨道写入 WAV
+            // 🚨 关键：一步转换，直接读视频的音频轨道写入 WAV（后台线程执行）
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 convertToWAV(tempPath, destPath, ^(BOOL success) {
                     dispatch_async(dispatch_get_main_queue(), ^{
