@@ -157,8 +157,8 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 转码：8000Hz 单声道 AAC（输出 m4a 容器） =====================
-static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
+// ===================== 转码：可指定采样率 =====================
+static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRate, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
@@ -169,9 +169,9 @@ static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^compl
 
         NSDictionary *outSettings = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @8000,
+            AVSampleRateKey: @(sampleRate),
             AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: @16000,
+            AVEncoderBitRateKey: sampleRate >= 16000 ? @32000 : @16000,
         };
 
         AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
@@ -233,6 +233,7 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     }];
 }
 
+// ===================== 发送：用 16000Hz，音质与试听一致 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
@@ -240,7 +241,6 @@ static void sendVoice(NSString *sourcePath) {
     UIViewController *chatVC = findMessageDetailController(topViewController());
     if (!chatVC) return;
 
-    // 🚨 输出 m4a（不是 aac），避免容器损坏
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
                             [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
 
@@ -248,8 +248,11 @@ static void sendVoice(NSString *sourcePath) {
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
 
-    convertToAAC(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) return;
+    addLog(@"📤 发送转码: %@ → 16000Hz", sourcePath.lastPathComponent);
+
+    // 🚨 发送用 16000Hz，音质与试听一致
+    convertToM4A(sourcePath, outputPath, 16000, ^(BOOL success) {
+        if (!success) { addLog(@"❌ 发送转码失败"); return; }
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
@@ -278,11 +281,13 @@ static void sendVoice(NSString *sourcePath) {
             BOOL retry = NO;
             [sendInv setArgument:&retry atIndex:3];
             [sendInv invoke];
+            addLog(@"✅ 已发送 (16000Hz)");
         }
         [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
     });
 }
 
+// ===================== 列表 =====================
 @implementation VoicePackListVC
 
 - (void)viewDidLoad {
@@ -465,6 +470,7 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
+// ===================== 视频转语音：输出 16000Hz m4a =====================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -507,11 +513,10 @@ static void sendVoice(NSString *sourcePath) {
                     }
 
                     [vc setProgress:1.0];
-                    [vc setTitle:@"正在转码..."];
+                    [vc setTitle:@"正在转码 (16000Hz)..."];
                     [vc stopTracking];
 
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        // 🚨 输出 .m4a，不是 .aac
                         NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
                         NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
@@ -520,7 +525,7 @@ static void sendVoice(NSString *sourcePath) {
                         [vc.view addSubview:spinner];
                         [spinner startAnimating];
 
-                        convertToAAC(tempAudioPath, destPath, ^(BOOL success) {
+                        convertToM4A(tempAudioPath, destPath, 16000, ^(BOOL success) {
                             [spinner stopAnimating];
                             [spinner removeFromSuperview];
                             [progressAlert dismissViewControllerAnimated:YES completion:^{
