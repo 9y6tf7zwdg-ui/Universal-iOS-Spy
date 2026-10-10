@@ -4,6 +4,7 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+// ===================== 原生进度弹窗 =====================
 @interface NativeProgressVC : UIViewController
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *titleLabel;
@@ -111,6 +112,26 @@ static void addLog(NSString *format, ...) {
     }
 }
 
+static NSString *audioInfo(NSString *path) {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    double duration = CMTimeGetSeconds(asset.duration);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"大小=%.2fKB, 时长=%.2fs",
+                          [attrs fileSize] / 1024.0, duration];
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!track) { [s appendString:@", 无音频轨道"]; return s; }
+    for (id desc in track.formatDescriptions) {
+        CMAudioFormatDescriptionRef fmt = (__bridge CMAudioFormatDescriptionRef)desc;
+        const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+        if (asbd) {
+            [s appendFormat:@", 采样率=%.0fHz, 声道=%u, 格式ID=%u",
+                asbd->mSampleRate, asbd->mChannelsPerFrame, (unsigned int)asbd->mFormatID];
+        }
+    }
+    return s;
+}
+
+// 🚨 新增：过滤 send_ 临时文件，避免列表越来越长
 static NSArray<NSString *> *getAllVoiceFiles() {
     NSError *error;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:getVoicePacksDirectory() error:&error];
@@ -118,7 +139,7 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     NSMutableArray *voiceFiles = [NSMutableArray array];
     for (NSString *file in files) {
         NSString *lower = [file lowercaseString];
-        if ([lower hasPrefix:@"send_"]) continue;
+        if ([lower hasPrefix:@"send_"]) continue;    // 过滤临时文件
         if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"] || [lower hasSuffix:@".aac"]) {
             [voiceFiles addObject:file];
         }
@@ -157,23 +178,8 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 增益处理：提升 PCM 音量 =====================
-// 对 Int16 PCM 数据施加线性增益，带削波保护
-static void applyGain(AVAudioPCMBuffer *buffer, float gain) {
-    if (gain <= 1.0f) return;
-    int16_t *data = buffer.int16ChannelData[0];
-    if (!data) return;
-    AVAudioFrameCount frames = buffer.frameLength;
-    for (AVAudioFrameCount i = 0; i < frames; i++) {
-        float v = data[i] * gain;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        data[i] = (int16_t)v;
-    }
-}
-
-// ===================== 转码：可指定采样率和增益 =====================
-static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRate, float gain, void (^completion)(BOOL success)) {
+// ===================== 转码：8000Hz 单声道 AAC（黄金版本，绝不改动） =====================
+static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
@@ -184,9 +190,9 @@ static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRa
 
         NSDictionary *outSettings = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @(sampleRate),
+            AVSampleRateKey: @8000,
             AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: sampleRate >= 16000 ? @32000 : @24000,   // 🚨 8000Hz 也把码率提到 24kbps，音质好一点
+            AVEncoderBitRateKey: @16000,
         };
 
         AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
@@ -217,23 +223,30 @@ static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRa
                 return inBuf;
             }];
 
-            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
+            if (status == AVAudioConverterOutputStatus_Error) {
+                addLog(@"❌ 转换错误: %@", convError);
+                writeError = YES;
+                break;
+            }
             if (outBuf.frameLength > 0) {
-                // 🚨 写入前对 PCM 施加增益
-                applyGain(outBuf, gain);
-
                 NSError *writeErr = nil;
                 [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { addLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
+                if (writeErr) {
+                    addLog(@"❌ 写入错误: %@", writeErr);
+                    writeError = YES;
+                    break;
+                }
             }
             if (status == AVAudioConverterOutputStatus_EndOfStream) break;
         }
+
         outFile = nil;
         inFile = nil;
         completion(!writeError);
     }
 }
 
+// ===================== 音频剪辑 =====================
 static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval start, NSTimeInterval end, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -251,31 +264,40 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     }];
 }
 
-// ===================== 发送：8000Hz + 2倍增益 =====================
+// ===================== 发送（黄金版本 + 发送后自动清理） =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
+    addLog(@"========== 开始发送 ==========");
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) { addLog(@"❌ 源文件不存在"); return; }
+    addLog(@"📁 源文件: %@", sourcePath);
+    addLog(@"📊 源文件信息: %@", audioInfo(sourcePath));
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) return;
+    if (!chatVC) { addLog(@"❌ 无聊天控制器"); return; }
+    addLog(@"✅ 聊天控制器: %@", NSStringFromClass([chatVC class]));
 
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
+                            [NSString stringWithFormat:@"send_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]]];
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
 
-    addLog(@"📤 发送转码: %@ → 8000Hz + 2x增益", sourcePath.lastPathComponent);
+    convertToAAC(sourcePath, outputPath, ^(BOOL success) {
+        if (!success) { addLog(@"❌ 转码失败"); return; }
 
-    // 🚨 8000Hz + 2倍增益
-    convertToM4A(sourcePath, outputPath, 8000, 2.0f, ^(BOOL success) {
-        if (!success) { addLog(@"❌ 发送转码失败"); return; }
+        addLog(@"📁 转码输出: %@", outputPath);
+        addLog(@"📊 转码输出信息: %@", audioInfo(outputPath));
+
+        NSError *playErr = nil;
+        AVAudioPlayer *vp = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:outputPath] error:&playErr];
+        if (playErr) { addLog(@"⚠️ 本地播放器无法加载(继续发送): %@", playErr); }
+        else { addLog(@"✅ 本地播放器识别时长: %.2f 秒", vp.duration); }
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
         SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) return;
+        if (![manager respondsToSelector:createSel]) { addLog(@"❌ 不支持 createSoundMessage"); return; }
 
         NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
         NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -288,20 +310,25 @@ static void sendVoice(NSString *sourcePath) {
 
         __unsafe_unretained id msg = nil;
         [inv getReturnValue:&msg];
+        addLog(@"✅ 消息构造: %@", msg ? @"成功" : @"失败");
 
         SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if ([chatVC respondsToSelector:sendSel]) {
-            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-            [sendInv setTarget:chatVC];
-            [sendInv setSelector:sendSel];
-            [sendInv setArgument:&msg atIndex:2];
-            BOOL retry = NO;
-            [sendInv setArgument:&retry atIndex:3];
-            [sendInv invoke];
-            addLog(@"✅ 已发送 (8000Hz + 2x增益)");
-        }
+        if (![chatVC respondsToSelector:sendSel]) { addLog(@"❌ 无 sendMessage:isRetry:"); return; }
+
+        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+        [sendInv setTarget:chatVC];
+        [sendInv setSelector:sendSel];
+        [sendInv setArgument:&msg atIndex:2];
+        BOOL retry = NO;
+        [sendInv setArgument:&retry atIndex:3];
+        [sendInv invoke];
+        addLog(@"✅ 已调用 sendMessage:isRetry:，发送完成");
+
+        // 🚨 新增：发送后自动清理临时文件
         [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
+        addLog(@"🧹 已清理临时文件");
+        addLog(@"========== 流程结束 ==========");
     });
 }
 
@@ -385,6 +412,7 @@ static void sendVoice(NSString *sourcePath) {
     [self dismissViewControllerAnimated:YES completion:^{ sendVoice(path); }];
 }
 
+// 🚨 新增：点击列表项弹出原生菜单（发送 / 重命名 / 剪辑）
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSString *fileName = self.files[indexPath.row];
@@ -405,6 +433,7 @@ static void sendVoice(NSString *sourcePath) {
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
+// 🚨 新增：重命名
 - (void)renameFile:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重命名" message:@"请输入新的文件名（不包含后缀）" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
@@ -428,6 +457,7 @@ static void sendVoice(NSString *sourcePath) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+// 🚨 新增：剪辑（原生进度弹窗，剪辑后转 AAC 保持格式一致）
 - (void)clipFile:(NSString *)fullPath fileName:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:fullPath] options:nil];
     double totalDuration = CMTimeGetSeconds(asset.duration);
@@ -447,8 +477,9 @@ static void sendVoice(NSString *sourcePath) {
         double end = [alert.textFields[1].text doubleValue];
         if (end <= start || start < 0) return;
 
-        NSString *newName = [NSString stringWithFormat:@"剪辑_%.0f_%@", [[NSDate date] timeIntervalSince1970], fileName];
-        NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
+        // 中间剪出 m4a，然后转成 AAC（与发送格式一致，方便试听）
+        NSString *tmpM4a = [getVoicePacksDirectory() stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"tmp_clip_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
 
         NativeProgressVC *vc = [[NativeProgressVC alloc] init];
         [vc setTitle:@"正在剪辑..."];
@@ -456,19 +487,30 @@ static void sendVoice(NSString *sourcePath) {
         [progressAlert setValue:vc forKey:@"contentViewController"];
         [self presentViewController:progressAlert animated:YES completion:nil];
 
-        clipAudio(fullPath, newPath, start, end, ^(BOOL success) {
-            [vc stopTracking];
-            [progressAlert dismissViewControllerAnimated:YES completion:^{
-                if (success) {
-                    self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                    [self.tableView reloadData];
-                }
-            }];
+        clipAudio(fullPath, tmpM4a, start, end, ^(BOOL success) {
+            if (!success) {
+                [vc stopTracking];
+                [progressAlert dismissViewControllerAnimated:YES completion:nil];
+                return;
+            }
+            NSString *newName = [NSString stringWithFormat:@"剪辑_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
+            NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
+            convertToAAC(tmpM4a, newPath, ^(BOOL ok2) {
+                [[NSFileManager defaultManager] removeItemAtPath:tmpM4a error:nil];
+                [vc stopTracking];
+                [progressAlert dismissViewControllerAnimated:YES completion:^{
+                    if (ok2) {
+                        self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                        [self.tableView reloadData];
+                    }
+                }];
+            });
         });
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+// 🚨 新增：滑动删除
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
@@ -488,7 +530,7 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
-// ===================== 视频转语音：输出 16000Hz m4a =====================
+// ===================== 视频转语音（黄金版本 + 进度条） =====================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -531,11 +573,11 @@ static void sendVoice(NSString *sourcePath) {
                     }
 
                     [vc setProgress:1.0];
-                    [vc setTitle:@"正在转码 (16000Hz)..."];
+                    [vc setTitle:@"正在转码..."];
                     [vc stopTracking];
 
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
+                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
                         NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
                         UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -543,8 +585,7 @@ static void sendVoice(NSString *sourcePath) {
                         [vc.view addSubview:spinner];
                         [spinner startAnimating];
 
-                        // 存储 16000Hz，不加增益（原始音质）
-                        convertToM4A(tempAudioPath, destPath, 16000, 1.0f, ^(BOOL success) {
+                        convertToAAC(tempAudioPath, destPath, ^(BOOL success) {
                             [spinner stopAnimating];
                             [spinner removeFromSuperview];
                             [progressAlert dismissViewControllerAnimated:YES completion:^{
