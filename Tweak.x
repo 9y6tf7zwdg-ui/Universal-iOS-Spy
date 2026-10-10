@@ -15,7 +15,6 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
 
-// ===================== 目录 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -25,7 +24,6 @@ static NSString *getVoicePacksDirectory() {
     return voiceDir;
 }
 
-// ===================== 日志 =====================
 static void addLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -51,7 +49,6 @@ static void addLog(NSString *format, ...) {
     }
 }
 
-// ===================== 音频信息 =====================
 static NSString *audioInfo(NSString *path) {
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
@@ -72,7 +69,6 @@ static NSString *audioInfo(NSString *path) {
     return s;
 }
 
-// ===================== 工具 =====================
 static NSArray<NSString *> *getAllVoiceFiles() {
     NSError *error;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:getVoicePacksDirectory() error:&error];
@@ -118,97 +114,101 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 用 AVAudioConverter 转码（iOS 10+，非常可靠） =====================
+// ===================== 修复版转码函数 =====================
+// 关键点：
+// 1. 用 initForWriting:settings:commonFormat:interleaved:error: 明确指定 Int16 单声道
+// 2. 循环结束后把 inFile/outFile 显式置 nil，强制触发文件关闭
+// 3. 加"转码后立即校验"日志
 static void convertToM4A(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
-    NSError *error = nil;
-    AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
-    if (error || !inFile) {
-        addLog(@"❌ 源文件读取失败: %@", error);
-        completion(NO);
-        return;
-    }
-
-    // 目标处理格式：16kHz 单声道 Float32
-    AVAudioFormat *outProcessingFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
-                                                                          sampleRate:16000
-                                                                            channels:1
-                                                                         interleaved:NO];
-
-    // 输出文件设置：m4a AAC 16kHz 单声道
-    NSDictionary *outSettings = @{
-        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @16000,
-        AVNumberOfChannelsKey: @1,
-        AVEncoderBitRateKey: @32000,
-    };
-
-    AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
-                                                      settings:outSettings
-                                                  commonFormat:AVAudioPCMFormatFloat32
-                                                   interleaved:NO
-                                                         error:&error];
-    if (error || !outFile) {
-        addLog(@"❌ 输出文件创建失败: %@", error);
-        completion(NO);
-        return;
-    }
-
-    AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outProcessingFormat];
-    if (!converter) {
-        addLog(@"❌ Converter 创建失败");
-        completion(NO);
-        return;
-    }
-
-    AVAudioFrameCount capacity = 4096;
-    AVAudioPCMBuffer *inBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
-    AVAudioPCMBuffer *outBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outProcessingFormat frameCapacity:capacity];
-
-    __block BOOL inputDone = NO;
-    __block BOOL writeError = NO;
-
-    while (1) {
-        NSError *convError = nil;
-        AVAudioConverterOutputStatus outStatus = [converter convertToBuffer:outBuffer
-                                                                      error:&convError
-                                                         withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
-            if (inputDone) {
-                *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                return nil;
-            }
-            NSError *readError = nil;
-            [inFile readIntoBuffer:inBuffer error:&readError];
-            if (readError || inBuffer.frameLength == 0) {
-                inputDone = YES;
-                *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                return nil;
-            }
-            *outStatus = AVAudioConverterInputStatus_HaveData;
-            return inBuffer;
-        }];
-
-        if (outStatus == AVAudioConverterOutputStatus_EndOfStream) break;
-        if (outStatus == AVAudioConverterOutputStatus_Error) {
-            addLog(@"❌ 转换错误: %@", convError);
-            writeError = YES;
-            break;
+    @autoreleasepool {
+        NSError *error = nil;
+        AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
+        if (error || !inFile) {
+            addLog(@"❌ 源文件读取失败: %@", error);
+            completion(NO);
+            return;
         }
 
-        if (outBuffer.frameLength > 0) {
-            NSError *writeErr = nil;
-            [outFile writeFromBuffer:outBuffer error:&writeErr];
-            if (writeErr) {
-                addLog(@"❌ 写入错误: %@", writeErr);
+        NSDictionary *outSettings = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @16000,
+            AVNumberOfChannelsKey: @1,
+            AVEncoderBitRateKey: @32000,
+        };
+
+        // 🚨 关键修复：明确指定 commonFormat 为 Int16 单声道
+        AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
+                                                          settings:outSettings
+                                                     commonFormat:AVAudioPCMFormatInt16
+                                                      interleaved:NO
+                                                            error:&error];
+        if (error || !outFile) {
+            addLog(@"❌ 输出文件创建失败: %@", error);
+            completion(NO);
+            return;
+        }
+
+        AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat
+                                                                      toFormat:outFile.processingFormat];
+        if (!converter) {
+            addLog(@"❌ Converter 创建失败");
+            outFile = nil;
+            completion(NO);
+            return;
+        }
+
+        AVAudioFrameCount capacity = 4096;
+        AVAudioPCMBuffer *inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
+        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFile.processingFormat frameCapacity:capacity];
+
+        BOOL writeError = NO;
+        while (1) {
+            NSError *convError = nil;
+            AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf
+                                                                       error:&convError
+                                                          withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
+                NSError *readError = nil;
+                [inFile readIntoBuffer:inBuf error:&readError];
+                if (readError || inBuf.frameLength == 0) {
+                    *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                    return nil;
+                }
+                *outStatus = AVAudioConverterInputStatus_HaveData;
+                return inBuf;
+            }];
+
+            if (status == AVAudioConverterOutputStatus_Error) {
+                addLog(@"❌ 转换错误: %@", convError);
                 writeError = YES;
                 break;
             }
-        }
-    }
 
-    completion(!writeError);
+            if (outBuf.frameLength > 0) {
+                NSError *writeErr = nil;
+                [outFile writeFromBuffer:outBuf error:&writeErr];
+                if (writeErr) {
+                    addLog(@"❌ 写入错误: %@", writeErr);
+                    writeError = YES;
+                    break;
+                }
+            }
+
+            if (status == AVAudioConverterOutputStatus_EndOfStream) break;
+        }
+
+        // 🚨 关键修复：显式释放，强制关闭文件、刷新 moov atom
+        outFile = nil;
+        inFile = nil;
+
+        // 校验
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
+        addLog(@"📊 转码后立即校验: 大小=%.2fKB", [attrs fileSize] / 1024.0);
+
+        completion(!writeError);
+    }
 }
 
 // ===================== 发送 =====================
@@ -225,10 +225,7 @@ static void sendVoice(NSString *sourcePath) {
     addLog(@"📊 源文件信息: %@", audioInfo(sourcePath));
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) {
-        addLog(@"❌ 找不到聊天控制器");
-        return;
-    }
+    if (!chatVC) { addLog(@"❌ 找不到聊天控制器"); return; }
     addLog(@"✅ 聊天控制器: %@", NSStringFromClass([chatVC class]));
 
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
@@ -239,10 +236,7 @@ static void sendVoice(NSString *sourcePath) {
     if (duration <= 0) duration = 1;
 
     convertToM4A(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) {
-            addLog(@"❌ 转码失败，中止发送");
-            return;
-        }
+        if (!success) { addLog(@"❌ 转码失败，中止发送"); return; }
 
         addLog(@"📁 转码输出: %@", outputPath);
         addLog(@"📊 转码输出信息: %@", audioInfo(outputPath));
@@ -258,10 +252,7 @@ static void sendVoice(NSString *sourcePath) {
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
         SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) {
-            addLog(@"❌ V2TIMManager 不支持 createSoundMessage");
-            return;
-        }
+        if (![manager respondsToSelector:createSel]) { addLog(@"❌ V2TIMManager 不支持"); return; }
 
         NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
         NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -277,10 +268,7 @@ static void sendVoice(NSString *sourcePath) {
         addLog(@"✅ 消息构造: %@", msg ? @"成功" : @"失败");
 
         SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if (![chatVC respondsToSelector:sendSel]) {
-            addLog(@"❌ 聊天控制器不支持 sendMessage:isRetry:");
-            return;
-        }
+        if (![chatVC respondsToSelector:sendSel]) { addLog(@"❌ 无 sendMessage:isRetry:"); return; }
 
         NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
         NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
@@ -317,11 +305,7 @@ static void sendVoice(NSString *sourcePath) {
     addLog(@"列表打开，找到 %lu 个语音文件", (unsigned long)self.files.count);
 }
 
-- (void)close {
-    stopPlayingAudio();
-    addLog(@"用户取消");
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
+- (void)close { stopPlayingAudio(); addLog(@"用户取消"); [self dismissViewControllerAnimated:YES completion:nil]; }
 
 - (void)videoAction {
     addLog(@"点击视频转语音");
@@ -340,9 +324,7 @@ static void sendVoice(NSString *sourcePath) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.files.count;
-}
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return self.files.count; }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
@@ -354,7 +336,6 @@ static void sendVoice(NSString *sourcePath) {
     cell.detailTextLabel.text = [NSString stringWithFormat:@"%.2f KB", [attrs fileSize] / 1024.0];
 
     UIView *rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 40)];
-
     UIButton *playBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     playBtn.frame = CGRectMake(0, 5, 40, 30);
     if (@available(iOS 13.0, *)) [playBtn setImage:[UIImage systemImageNamed:@"play.circle.fill"] forState:UIControlStateNormal];
@@ -446,9 +427,7 @@ static void sendVoice(NSString *sourcePath) {
 
 @end
 
-// ===================== 方案 C =====================
 %hook CWTalkBackView
-
 - (void)sendRecorde:(id)sender {
     addLog(@"拦截到 sendRecorde，弹出语音列表");
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
@@ -456,5 +435,4 @@ static void sendVoice(NSString *sourcePath) {
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [topViewController() presentViewController:nav animated:YES completion:nil];
 }
-
 %end
