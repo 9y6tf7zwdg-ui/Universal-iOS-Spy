@@ -4,106 +4,79 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 进度条 HUD =====================
-@interface ProgressHUD : UIView
+// ===================== 原生进度弹窗 =====================
+@interface NativeProgressVC : UIViewController
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, weak) AVAssetExportSession *session;
-@property (nonatomic, weak) UIView *container;
-+ (instancetype)shared;
-- (void)showOnView:(UIView *)view title:(NSString *)title;
-- (void)trackSession:(AVAssetExportSession *)session;
-- (void)updateProgress:(float)progress;
-- (void)dismiss;
+@property (nonatomic, strong) AVAssetExportSession *session;
 @end
 
-static ProgressHUD *g_hud = nil;
+@implementation NativeProgressVC
 
-@implementation ProgressHUD
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.preferredContentSize = CGSizeMake(270, 100);
 
-+ (instancetype)shared {
-    if (!g_hud) {
-        g_hud = [[ProgressHUD alloc] initWithFrame:CGRectZero];
-    }
-    return g_hud;
+    _titleLabel = [[UILabel alloc] init];
+    _titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    _titleLabel.textAlignment = NSTextAlignmentCenter;
+    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_titleLabel];
+
+    _progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    _progressView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_progressView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_titleLabel.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:20],
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+        [_titleLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+        [_progressView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:30],
+        [_progressView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-30],
+        [_progressView.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:15]
+    ]];
 }
 
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
-        self.layer.cornerRadius = 12;
-
-        _titleLabel = [[UILabel alloc] init];
-        _titleLabel.textColor = [UIColor whiteColor];
-        _titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        _titleLabel.textAlignment = NSTextAlignmentCenter;
-        [self addSubview:_titleLabel];
-
-        _progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-        _progressView.progressTintColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
-        _progressView.trackTintColor = [UIColor colorWithWhite:1 alpha:0.3];
-        [self addSubview:_progressView];
-    }
-    return self;
+- (void)setTitle:(NSString *)title {
+    _titleLabel.text = title;
 }
 
-- (void)showOnView:(UIView *)view title:(NSString *)title {
-    self.container = view;
-    self.titleLabel.text = title;
-    self.progressView.progress = 0;
-
-    CGFloat w = 200, h = 80;
-    self.frame = CGRectMake((view.bounds.size.width - w) / 2,
-                            (view.bounds.size.height - h) / 2,
-                            w, h);
-    self.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
-                            UIViewAutoresizingFlexibleRightMargin |
-                            UIViewAutoresizingFlexibleTopMargin |
-                            UIViewAutoresizingFlexibleBottomMargin;
-
-    self.titleLabel.frame = CGRectMake(10, 15, w - 20, 20);
-    self.progressView.frame = CGRectMake(20, 50, w - 40, 4);
-
-    [view addSubview:self];
-    [view bringSubviewToFront:self];
-
+- (void)startTrackingSession:(AVAssetExportSession *)session {
+    self.session = session;
     [self.timer invalidate];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 
-- (void)trackSession:(AVAssetExportSession *)session {
-    self.session = session;
-}
-
 - (void)tick {
-    if (self.session) {
-        float p = self.session.progress;
-        if (p > 0 && p <= 1.0) {
-            [self.progressView setProgress:p animated:YES];
+    @try {
+        if (self.session && self.session.status == AVAssetExportSessionStatusExporting) {
+            float p = self.session.progress;
+            if (p > 0 && p <= 1.0) {
+                [self.progressView setProgress:p animated:YES];
+            }
         }
-    }
+    } @catch (NSException *e) {}
 }
 
-- (void)updateProgress:(float)progress {
+- (void)setProgress:(float)p {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.progressView setProgress:progress animated:YES];
+        [self.progressView setProgress:p animated:YES];
     });
 }
 
-- (void)dismiss {
-    [self.timer invalidate];
-    self.timer = nil;
-    self.session = nil;
+- (void)stopTracking {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self removeFromSuperview];
+        [self.timer invalidate];
+        self.timer = nil;
+        self.session = nil;
     });
 }
 
 @end
 
-// ===================== 基础声明 =====================
+// ===================== 声明 =====================
 @interface MessageDetailController : UIViewController
 @end
 
@@ -252,7 +225,7 @@ static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^compl
     }
 }
 
-// ===================== 音频剪辑 =====================
+// ===================== 剪辑 =====================
 static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval start, NSTimeInterval end, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -465,13 +438,21 @@ static void sendVoice(NSString *sourcePath) {
         NSString *newName = [NSString stringWithFormat:@"剪辑_%.0f_%@", [[NSDate date] timeIntervalSince1970], fileName];
         NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
 
-        [[ProgressHUD shared] showOnView:self.view title:@"正在剪辑..."];
+        // 🚨 用系统原生的 Alert + ProgressView 显示进度
+        NativeProgressVC *vc = [[NativeProgressVC alloc] init];
+        [vc setTitle:@"正在剪辑..."];
+        UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"正在处理" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [progressAlert setValue:vc forKey:@"contentViewController"];
+        [self presentViewController:progressAlert animated:YES completion:nil];
+
         clipAudio(fullPath, newPath, start, end, ^(BOOL success) {
-            [[ProgressHUD shared] dismiss];
-            if (success) {
-                self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                [self.tableView reloadData];
-            }
+            [vc stopTracking];
+            [progressAlert dismissViewControllerAnimated:YES completion:^{
+                if (success) {
+                    self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                    [self.tableView reloadData];
+                }
+            }];
         });
     }]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -481,7 +462,6 @@ static void sendVoice(NSString *sourcePath) {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
 
-    // 🚨 修复：正确的方法是 contextualActionWithStyle:title:handler:
     UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认删除" message:[NSString stringWithFormat:@"确定要删除“%@”吗？", fileName] preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) { completionHandler(NO); }]];
@@ -497,19 +477,33 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
+// 🚨 视频转语音：系统原生进度弹窗
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
-    PHPickerResult *result = results.firstObject;
-    if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
-        [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) return;
-            NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
-            [fm copyItemAtPath:url.path toPath:tempPath error:&error];
-            if (error) return;
 
+    PHPickerResult *result = results.firstObject;
+    if (![result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) return;
+
+    [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
+        if (error || !url) return;
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
+        if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
+        [fm copyItemAtPath:url.path toPath:tempPath error:nil];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!self.view) return;
+
+            // 1. 弹出系统原生进度 Alert
+            NativeProgressVC *vc = [[NativeProgressVC alloc] init];
+            [vc setTitle:@"正在提取音频..."];
+            UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"视频转语音" message:nil preferredStyle:UIAlertControllerStyleAlert];
+            [progressAlert setValue:vc forKey:@"contentViewController"];
+            [self presentViewController:progressAlert animated:YES completion:nil];
+
+            // 2. 提取音频
             NSString *tempAudioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"temp_extract.m4a"];
             if ([fm fileExistsAtPath:tempAudioPath]) [fm removeItemAtPath:tempAudioPath error:nil];
 
@@ -517,38 +511,46 @@ static void sendVoice(NSString *sourcePath) {
             AVAssetExportSession *extractor = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
             extractor.outputURL = [NSURL fileURLWithPath:tempAudioPath];
             extractor.outputFileType = AVFileTypeAppleM4A;
-
-            [[ProgressHUD shared] showOnView:self.view title:@"正在提取音频..."];
-            [[ProgressHUD shared] trackSession:extractor];
+            [vc startTrackingSession:extractor];
 
             [extractor exportAsynchronouslyWithCompletionHandler:^{
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (extractor.status != AVAssetExportSessionStatusCompleted) {
-                        [[ProgressHUD shared] dismiss];
+                        [vc stopTracking];
+                        [progressAlert dismissViewControllerAnimated:YES completion:nil];
                         return;
                     }
 
-                    [[ProgressHUD shared] updateProgress:1.0];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        [[ProgressHUD shared] showOnView:self.view title:@"正在转码..."];
+                    // 3. 切换到转码阶段
+                    [vc setProgress:1.0];
+                    [vc setTitle:@"正在转码..."];
+                    [vc stopTracking];
 
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
                         NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
+
+                        // 转码用菊花转圈（因为 AVAudioConverter 没有进度回调）
+                        UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+                        spinner.frame = CGRectMake(125, 60, 20, 20);
+                        [vc.view addSubview:spinner];
+                        [spinner startAnimating];
+
                         convertToAAC(tempAudioPath, destPath, ^(BOOL success) {
-                            [[ProgressHUD shared] updateProgress:1.0];
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                                [[ProgressHUD shared] dismiss];
+                            [spinner stopAnimating];
+                            [spinner removeFromSuperview];
+                            [progressAlert dismissViewControllerAnimated:YES completion:^{
                                 if (success) {
                                     self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
                                     [self.tableView reloadData];
                                 }
-                            });
+                            }];
                         });
                     });
                 });
             }];
-        }];
-    }
+        });
+    }];
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
