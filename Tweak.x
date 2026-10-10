@@ -2,12 +2,12 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 
-// ===================== 纯日志写入 =====================
-static NSString *getNativeTrackerLogPath() {
+// ===================== 日志 =====================
+static NSString *getLogPath() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:voiceDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [voiceDir stringByAppendingPathComponent:@"native_tracker.log"];
+    NSString *dir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"export_test.log"];
 }
 
 static void traceLog(NSString *format, ...) {
@@ -15,104 +15,89 @@ static void traceLog(NSString *format, ...) {
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    NSLog(@"[NativeTracker] %@", msg);
-
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"HH:mm:ss.SSS";
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], msg];
-
-    NSString *logPath = getNativeTrackerLogPath();
+    NSString *path = getLogPath();
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:logPath]) {
-        [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (![fm fileExistsAtPath:path]) {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } else {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         [fh seekToEndOfFile];
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     }
 }
 
-// 辅助：记录文件的真实状态
-static void traceFileInfo(NSString *prefix, NSString *path) {
-    if (!path) {
-        traceLog(@"%@ 路径为空", prefix);
-        return;
-    }
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) {
-        traceLog(@"%@ [不存在] %@", prefix, path);
-        return;
-    }
-    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
-    unsigned long long size = [attrs fileSize];
-    traceLog(@"%@ [存在] %@ | 大小: %llu 字节 | 权限: %@ | 属主: %@", 
-             prefix, path, size, attrs[NSFilePosixPermissions], attrs[NSFileOwnerAccountName]);
-}
-
-// ===================== 钩子：腾讯云 IM 发送入口 =====================
-%hook V2TIMManager
-
-- (id)createSoundMessage:(NSString *)soundPath duration:(int)duration {
-    traceLog(@"\n========== 🎯 V2TIMManager createSoundMessage ==========");
-    traceLog(@"传入的 soundPath: %@", soundPath);
-    traceLog(@"传入的 duration: %d", duration);
-    traceFileInfo(@"腾讯云拿到的文件", soundPath);
-    id result = %orig;
-    traceLog(@"createSoundMessage 返回值: %@", result);
-    return result;
-}
-%end
-
-// ===================== 钩子：录音器底层 =====================
-%hook CWRecorder
-
-- (NSString *)recordPath {
-    NSString *path = %orig;
-    traceLog(@"\n========== 🎙️ CWRecorder recordPath ==========");
-    traceLog(@"录音文件路径: %@", path);
-    traceFileInfo(@"录音文件", path);
-    return path;
-}
-
-- (NSTimeInterval)recordDuration {
-    NSTimeInterval duration = %orig;
-    traceLog(@"\n========== ⏱️ CWRecorder recordDuration ==========");
-    traceLog(@"录音时长: %f 秒", duration);
-    return duration;
-}
-
-- (void)startRecord {
-    traceLog(@"\n========== ▶️ CWRecorder 开始录音 startRecord ==========");
-    %orig;
-}
-
-- (void)stopRecord {
-    traceLog(@"\n========== ⏹️ CWRecorder 停止录音 stopRecord ==========");
-    %orig;
-}
-%end
-
-// ===================== 钩子：聊天界面的发送动作 =====================
+// ===================== Hook：聊天界面发送按钮 =====================
 %hook MessageDetailController
 
 - (void)sendSound {
-    traceLog(@"\n========== 📤 MessageDetailController 调用了 sendSound ==========");
+    traceLog(@"触发原生 sendSound，不干预");
     %orig;
 }
 
 - (void)sendMessage:(id)msg isRetry:(BOOL)retry {
-    traceLog(@"\n========== 📨 MessageDetailController sendMessage:isRetry: ==========");
-    traceLog(@"消息对象: %@ | 是否重试: %@", msg, retry ? @"YES" : @"NO");
+    traceLog(@"触发原生 sendMessage:isRetry:，不干预");
     %orig;
 }
+
 %end
 
-// ===================== 钩子：对讲按钮 =====================
+// ===================== 我们的纯诊断测试 =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
-    traceLog(@"\n========== 🎤 CWTalkBackView sendRecorde (对讲发送) ==========");
-    %orig;
+    // 1. 寻找源文件（这里我们直接找用户放在 VoicePacks 里的 早上好.wav）
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *sourcePath = [docPath stringByAppendingPathComponent:@"VoicePacks/早上好.wav"];
+    
+    traceLog(@"\n========== 🧪 开始转码测试 ==========");
+    traceLog(@"源文件路径: %@", sourcePath);
+    
+    if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
+        traceLog(@"❌ 源文件不存在，请把 早上好.wav 放进 VoicePacks 目录");
+        return %orig;
+    }
+    
+    // 2. 设定输出路径为系统原生认可的 AAC 路径（弄成 m4a 再改后缀）
+    NSString *outputPath = [docPath stringByAppendingPathComponent:@"VoicePacks/test_export.aac"];
+    [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
+    
+    // 3. 使用 AVAssetExportSession 进行标准转码
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
+    AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    exportSession.outputURL = [NSURL fileURLWithPath:outputPath];
+    exportSession.outputFileType = AVFileTypeAppleM4A;
+    
+    traceLog(@"开始导出为 M4A...");
+    [exportSession exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            traceLog(@"导出状态: %ld", (long)exportSession.status);
+            if (exportSession.status == AVAssetExportSessionStatusCompleted) {
+                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
+                traceLog(@"✅ 导出成功! 文件大小: %llu 字节", [attrs fileSize]);
+                traceLog(@"文件路径: %@", outputPath);
+                
+                // 读取前 32 字节，看是否是标准 M4A 容器
+                NSData *data = [NSData dataWithContentsOfFile:outputPath];
+                NSMutableString *hex = [NSMutableString string];
+                for (int i = 0; i < 32 && i < data.length; i++) {
+                    [hex appendFormat:@"%02X ", ((const unsigned char *)data.bytes)[i]];
+                }
+                traceLog(@"🔍 M4A 文件头(前32字节): %@", hex);
+                
+                // 现在，我们可以尝试用原生录音目录的格式来发送这个文件！
+                // （这里只写日志，不实际发送，保证诊断纯度）
+                traceLog(@"✅ 诊断完成，等待下一步指令");
+                
+            } else {
+                traceLog(@"❌ 导出失败: %@", exportSession.error);
+            }
+        });
+    }];
+    
+    // 不调用 %orig，阻止原有录音逻辑
 }
 %end
