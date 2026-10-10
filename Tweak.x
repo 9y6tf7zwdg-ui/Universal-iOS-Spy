@@ -157,8 +157,23 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 转码：可指定采样率 =====================
-static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRate, void (^completion)(BOOL success)) {
+// ===================== 增益处理：提升 PCM 音量 =====================
+// 对 Int16 PCM 数据施加线性增益，带削波保护
+static void applyGain(AVAudioPCMBuffer *buffer, float gain) {
+    if (gain <= 1.0f) return;
+    int16_t *data = buffer.int16ChannelData[0];
+    if (!data) return;
+    AVAudioFrameCount frames = buffer.frameLength;
+    for (AVAudioFrameCount i = 0; i < frames; i++) {
+        float v = data[i] * gain;
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        data[i] = (int16_t)v;
+    }
+}
+
+// ===================== 转码：可指定采样率和增益 =====================
+static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRate, float gain, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
@@ -171,7 +186,7 @@ static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRa
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
             AVSampleRateKey: @(sampleRate),
             AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: sampleRate >= 16000 ? @32000 : @16000,
+            AVEncoderBitRateKey: sampleRate >= 16000 ? @32000 : @24000,   // 🚨 8000Hz 也把码率提到 24kbps，音质好一点
         };
 
         AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
@@ -204,6 +219,9 @@ static void convertToM4A(NSString *inputPath, NSString *outputPath, int sampleRa
 
             if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
             if (outBuf.frameLength > 0) {
+                // 🚨 写入前对 PCM 施加增益
+                applyGain(outBuf, gain);
+
                 NSError *writeErr = nil;
                 [outFile writeFromBuffer:outBuf error:&writeErr];
                 if (writeErr) { addLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
@@ -233,7 +251,7 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     }];
 }
 
-// ===================== 发送：用 16000Hz，音质与试听一致 =====================
+// ===================== 发送：8000Hz + 2倍增益 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
@@ -248,10 +266,10 @@ static void sendVoice(NSString *sourcePath) {
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
 
-    addLog(@"📤 发送转码: %@ → 16000Hz", sourcePath.lastPathComponent);
+    addLog(@"📤 发送转码: %@ → 8000Hz + 2x增益", sourcePath.lastPathComponent);
 
-    // 🚨 发送用 16000Hz，音质与试听一致
-    convertToM4A(sourcePath, outputPath, 16000, ^(BOOL success) {
+    // 🚨 8000Hz + 2倍增益
+    convertToM4A(sourcePath, outputPath, 8000, 2.0f, ^(BOOL success) {
         if (!success) { addLog(@"❌ 发送转码失败"); return; }
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
@@ -281,7 +299,7 @@ static void sendVoice(NSString *sourcePath) {
             BOOL retry = NO;
             [sendInv setArgument:&retry atIndex:3];
             [sendInv invoke];
-            addLog(@"✅ 已发送 (16000Hz)");
+            addLog(@"✅ 已发送 (8000Hz + 2x增益)");
         }
         [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
     });
@@ -525,7 +543,8 @@ static void sendVoice(NSString *sourcePath) {
                         [vc.view addSubview:spinner];
                         [spinner startAnimating];
 
-                        convertToM4A(tempAudioPath, destPath, 16000, ^(BOOL success) {
+                        // 存储 16000Hz，不加增益（原始音质）
+                        convertToM4A(tempAudioPath, destPath, 16000, 1.0f, ^(BOOL success) {
                             [spinner stopAnimating];
                             [spinner removeFromSuperview];
                             [progressAlert dismissViewControllerAnimated:YES completion:^{
