@@ -7,7 +7,7 @@ static NSString *getLogPath() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *dir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [dir stringByAppendingPathComponent:@"send_test.log"];
+    return [dir stringByAppendingPathComponent:@"final_send_test.log"];
 }
 
 static void traceLog(NSString *format, ...) {
@@ -56,66 +56,120 @@ static UIViewController *topViewController() {
     return topVC;
 }
 
-// ===================== 核心发送函数 =====================
-static void testSendM4A(NSString *sourcePath) {
-    traceLog(@"\n========== 🚀 开始终极发送测试 ==========");
-    traceLog(@"源文件: %@", sourcePath);
-    
+// ===================== 核心：强制输出 8000Hz 单声道 AAC =====================
+static void transcodeToNativeAAC(NSString *sourcePath, NSString *outputPath, void (^completion)(BOOL success)) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+
+    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:sourcePath]];
+    NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+    if (audioTracks.count == 0) {
+        traceLog(@"❌ 源文件无音频轨道");
+        completion(NO);
+        return;
+    }
+
+    NSError *error = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    AVAssetReaderTrackOutput *readerOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTracks.firstObject outputSettings:@{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @8000, // 读取时就强制 8000Hz
+        AVNumberOfChannelsKey: @1,
+        AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsFloatKey: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO
+    }];
+    [reader addOutput:readerOutput];
+    [reader startReading];
+
+    // 写入设置：AAC 8000Hz 单声道
+    NSDictionary *writerSettings = @{
+        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey: @8000,
+        AVNumberOfChannelsKey: @1,
+        AVEncoderBitRateKey: @16000,
+    };
+
+    NSError *writerError = nil;
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeAppleM4A error:&writerError];
+    if (writerError) {
+        traceLog(@"❌ 创建 Writer 失败: %@", writerError);
+        completion(NO);
+        return;
+    }
+
+    AVAssetWriterInput *writerInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:writerSettings];
+    writerInput.expectsMediaDataInRealTime = NO;
+    [writer addInput:writerInput];
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    [writerInput requestMediaDataWhenReadyOnQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0) usingBlock:^{
+        while (writerInput.isReadyForMoreMediaData) {
+            CMSampleBufferRef sampleBuffer = [readerOutput copyNextSampleBuffer];
+            if (!sampleBuffer) {
+                [writerInput markAsFinished];
+                [writer finishWritingWithCompletionHandler:^{
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (writer.status == AVAssetWriterStatusCompleted) {
+                            traceLog(@"✅ 转码成功: %@", outputPath.lastPathComponent);
+                            completion(YES);
+                        } else {
+                            traceLog(@"❌ 写入失败: %@", writer.error);
+                            completion(NO);
+                        }
+                    });
+                }];
+                break;
+            }
+            if (![writerInput appendSampleBuffer:sampleBuffer]) {
+                traceLog(@"❌ 追加样本失败");
+                CFRelease(sampleBuffer);
+                [writerInput markAsFinished];
+                [writer cancelWriting];
+                completion(NO);
+                break;
+            }
+            CFRelease(sampleBuffer);
+        }
+    }];
+}
+
+// ===================== 终极发送函数 =====================
+static void testSendFinal(NSString *sourcePath) {
+    traceLog(@"\n========== 🚀 终极发送测试 (8000Hz 单声道) ==========");
     if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
         traceLog(@"❌ 源文件不存在");
         return;
     }
 
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    // 原生录音所在的真实目录
     NSString *hcrDir = [docPath stringByAppendingPathComponent:@"HCRecordAudio/1A913486"];
     [[NSFileManager defaultManager] createDirectoryAtPath:hcrDir withIntermediateDirectories:YES attributes:nil error:nil];
 
-    // 用 UUID 命名，模仿原生行为
     NSString *uuid = [[NSUUID UUID] UUIDString];
-    NSString *tempM4aPath = [hcrDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.m4a", uuid]];
     NSString *finalAacPath = [hcrDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.aac", uuid]];
-    [[NSFileManager defaultManager] removeItemAtPath:tempM4aPath error:nil];
-    [[NSFileManager defaultManager] removeItemAtPath:finalAacPath error:nil];
 
-    // 1. 转码为标准 M4A
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
-    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-    session.outputURL = [NSURL fileURLWithPath:tempM4aPath];
-    session.outputFileType = AVFileTypeAppleM4A;
-
-    [session exportAsynchronouslyWithCompletionHandler:^{
-        if (session.status != AVAssetExportSessionStatusCompleted) {
-            traceLog(@"❌ 导出失败: %@", session.error);
-            return;
-        }
-        
-        // 2. 重命名为 .aac（腾讯云 IM 偏好这个后缀）
-        NSError *moveErr = nil;
-        [[NSFileManager defaultManager] moveItemAtPath:tempM4aPath toPath:finalAacPath error:&moveErr];
-        if (moveErr) {
-            traceLog(@"❌ 重命名失败: %@", moveErr);
-            return;
-        }
+    transcodeToNativeAAC(sourcePath, finalAacPath, ^(BOOL success) {
+        if (!success) return;
         
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:finalAacPath error:nil];
-        traceLog(@"✅ 转码并重命名完成。文件大小: %llu 字节", [attrs fileSize]);
+        traceLog(@"✅ 转码完成。文件大小: %llu 字节", [attrs fileSize]);
 
-        // 3. 强行进入主线程并执行发送
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *chatVC = findMessageDetailController(topViewController());
             if (!chatVC) {
-                traceLog(@"❌ 找不到 MessageDetailController，请确认你正在聊天界面");
+                traceLog(@"❌ 找不到 MessageDetailController");
                 return;
             }
 
-            // 准备时长
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
             int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
             if (duration <= 0) duration = 1;
 
             traceLog(@"开始调用腾讯云 IM...");
 
-            // 创建消息
             Class v2Mgr = NSClassFromString(@"V2TIMManager");
             id manager = [v2Mgr performSelector:@selector(sharedInstance)];
             SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
@@ -133,7 +187,6 @@ static void testSendM4A(NSString *sourcePath) {
             [inv getReturnValue:&msg];
             traceLog(@"📨 createSoundMessage 返回: %@", msg);
 
-            // 发送消息
             SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
             if ([chatVC respondsToSelector:sendSel]) {
                 NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
@@ -145,29 +198,24 @@ static void testSendM4A(NSString *sourcePath) {
                 [sendInv setArgument:&retry atIndex:3];
                 [sendInv invoke];
                 traceLog(@"✅ 已调用 sendMessage:isRetry:！请检查对方是否收到声音！");
-            } else {
-                traceLog(@"❌ MessageDetailController 不响应 sendMessage:isRetry:");
             }
         });
-    }];
+    });
 }
 
 // ===================== Hook =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
-    // 长按对讲松手时触发此测试
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *sourcePath = [docPath stringByAppendingPathComponent:@"VoicePacks/早上好.wav"];
     
-    // 如果找不到早上好.wav，用一个存在的音频文件测试
     if (![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        traceLog(@"⚠️ VoicePacks/早上好.wav 不存在");
-        // 这里为了不阻断，还是调用 %orig，但会记录警告
+        traceLog(@"⚠️ VoicePacks/早上好.wav 不存在，请先放入文件");
         return %orig;
     }
     
-    testSendM4A(sourcePath);
-    // 阻止原始录音行为，防止冲突
+    testSendFinal(sourcePath);
+    // 阻止原有录音行为
 }
 %end
