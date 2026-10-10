@@ -124,38 +124,40 @@ static UIViewController *findMessageDetailController(UIViewController *vc) {
     return nil;
 }
 
+// ===================== 音频会话：强制用扬声器播放（修复听筒问题） =====================
 static AVAudioPlayer *sharedAudioPlayer = nil;
+
+static void setupSpeakerPlayback() {
+    @try {
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        [session setCategory:AVAudioSessionCategoryPlayback error:nil];
+        [session setActive:YES error:nil];
+    } @catch (NSException *e) {}
+}
+
 static void stopPlayingAudio() {
     if (sharedAudioPlayer && sharedAudioPlayer.isPlaying) [sharedAudioPlayer stop];
     sharedAudioPlayer = nil;
 }
 
 // ===================== 发送：直接发源文件，不转码 =====================
-// 早上好.wav / 叫.wav / 叫床.wav 这些源文件本身就能被 IM 接受，
-// 所以不做任何转码，直接构造消息发出。
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        addLog(@"❌ 源文件不存在");
-        return;
-    }
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) {
-        addLog(@"❌ 无聊天控制器");
-        return;
-    }
+    if (!chatVC) return;
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
 
-    addLog(@"📤 直接发送源文件: %@, 时长: %d秒", sourcePath.lastPathComponent, duration);
+    addLog(@"📤 发送: %@, 时长: %d秒", sourcePath.lastPathComponent, duration);
 
     Class v2Mgr = NSClassFromString(@"V2TIMManager");
     id manager = [v2Mgr performSelector:@selector(sharedInstance)];
     SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-    if (![manager respondsToSelector:createSel]) { addLog(@"❌ 不支持 createSoundMessage"); return; }
+    if (![manager respondsToSelector:createSel]) return;
 
     NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -168,10 +170,9 @@ static void sendVoice(NSString *sourcePath) {
 
     __unsafe_unretained id msg = nil;
     [inv getReturnValue:&msg];
-    addLog(@"✅ 消息构造: %@", msg ? @"成功" : @"失败");
 
     SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-    if (![chatVC respondsToSelector:sendSel]) { addLog(@"❌ 无 sendMessage:isRetry:"); return; }
+    if (![chatVC respondsToSelector:sendSel]) return;
 
     NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
     NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
@@ -184,86 +185,108 @@ static void sendVoice(NSString *sourcePath) {
     addLog(@"✅ 发送完成");
 }
 
-// ===================== 视频转语音：16000Hz WAV（和 早上好.wav 一致） =====================
-static void convertToWAV(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+// ===================== 视频转语音：手动构建 WAV 文件，绝对无格式问题 =====================
+static void writeWAVHeader(NSFileHandle *fh, uint32_t dataSize) {
+    // RIFF header
+    [fh writeData:[@"RIFF" dataUsingEncoding:NSASCIIStringEncoding]];
+    uint32_t fileSize = 36 + dataSize;
+    [fh writeData:[NSData dataWithBytes:&fileSize length:4]];
+    [fh writeData:[@"WAVE" dataUsingEncoding:NSASCIIStringEncoding]];
 
-    @autoreleasepool {
-        NSError *error = nil;
-        AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
-        if (error || !inFile) { addLog(@"❌ 读取源文件失败: %@", error); completion(NO); return; }
+    // fmt chunk
+    [fh writeData:[@"fmt " dataUsingEncoding:NSASCIIStringEncoding]];
+    uint32_t fmtSize = 16;
+    [fh writeData:[NSData dataWithBytes:&fmtSize length:4]];
+    uint16_t audioFormat = 1; // PCM
+    [fh writeData:[NSData dataWithBytes:&audioFormat length:2]];
+    uint16_t channels = 1;
+    [fh writeData:[NSData dataWithBytes:&channels length:2]];
+    uint32_t sampleRate = 16000;
+    [fh writeData:[NSData dataWithBytes:&sampleRate length:4]];
+    uint32_t byteRate = sampleRate * channels * 2; // 32000
+    [fh writeData:[NSData dataWithBytes:&byteRate length:4]];
+    uint16_t blockAlign = channels * 2; // 2
+    [fh writeData:[NSData dataWithBytes:&blockAlign length:2]];
+    uint16_t bitsPerSample = 16;
+    [fh writeData:[NSData dataWithBytes:&bitsPerSample length:2]];
 
-        // 16kHz 单声道 16bit PCM WAV（和早上好.wav 完全一致）
-        NSDictionary *wavSettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @16000,
-            AVNumberOfChannelsKey: @1,
-            AVLinearPCMBitDepthKey: @16,
-            AVLinearPCMIsFloatKey: @NO,
-            AVLinearPCMIsBigEndianKey: @NO,
-            AVLinearPCMIsNonInterleaved: @NO,
-        };
-
-        AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
-                                                          settings:wavSettings
-                                                     commonFormat:AVAudioPCMFormatInt16
-                                                      interleaved:YES
-                                                            error:&error];
-        if (error || !outFile) { addLog(@"❌ 创建 WAV 失败: %@", error); completion(NO); return; }
-
-        AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outFile.processingFormat];
-        if (!converter) { addLog(@"❌ Converter 创建失败"); outFile = nil; completion(NO); return; }
-
-        AVAudioFrameCount capacity = 4096;
-        AVAudioPCMBuffer *inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
-        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFile.processingFormat frameCapacity:capacity];
-
-        BOOL writeError = NO;
-        int safety = 0;
-        while (1) {
-            if (++safety > 500000) { addLog(@"⚠️ 循环保护"); break; }
-            NSError *convError = nil;
-            AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf error:&convError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
-                NSError *readError = nil;
-                [inFile readIntoBuffer:inBuf error:&readError];
-                if (readError || inBuf.frameLength == 0) {
-                    *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                    return nil;
-                }
-                *outStatus = AVAudioConverterInputStatus_HaveData;
-                return inBuf;
-            }];
-            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ 转换错误: %@", convError); writeError = YES; break; }
-            if (outBuf.frameLength > 0) {
-                NSError *writeErr = nil;
-                [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { addLog(@"❌ 写入错误: %@", writeErr); writeError = YES; break; }
-            }
-            if (status == AVAudioConverterOutputStatus_EndOfStream) break;
-        }
-        outFile = nil;
-        inFile = nil;
-        completion(!writeError);
-    }
+    // data chunk
+    [fh writeData:[@"data" dataUsingEncoding:NSASCIIStringEncoding]];
+    [fh writeData:[NSData dataWithBytes:&dataSize length:4]];
 }
 
-// ===================== 音频剪辑 =====================
-static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval start, NSTimeInterval end, void (^completion)(BOOL success)) {
+// 一步转换：直接用 AVAssetReader 读音频轨 → 手动写 WAV 文件
+// 无中间文件、无 AVAudioFile、无容器问题
+static void convertVideoToWAV(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
-    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-    session.outputURL = [NSURL fileURLWithPath:outputPath];
-    session.outputFileType = AVFileTypeAppleM4A;
-    session.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(start, 1000), CMTimeMakeWithSeconds(end - start, 1000));
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:inputPath] options:nil];
+    AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!audioTrack) { addLog(@"❌ 无音频轨道"); completion(NO); return; }
 
-    [session exportAsynchronouslyWithCompletionHandler:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            completion(session.status == AVAssetExportSessionStatusCompleted);
-        });
-    }];
+    NSError *error = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (error || !reader) { addLog(@"❌ reader 创建失败"); completion(NO); return; }
+
+    // 目标：16kHz 单声道 16bit PCM
+    NSDictionary *readerSettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @16000,
+        AVNumberOfChannelsKey: @1,
+        AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsFloatKey: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO,
+    };
+    AVAssetReaderTrackOutput *readerOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:readerSettings];
+    readerOutput.alwaysCopiesSampleData = NO;
+    if (![reader canAddOutput:readerOutput]) { addLog(@"❌ 无法添加 reader output"); completion(NO); return; }
+    [reader addOutput:readerOutput];
+
+    // 创建输出文件（先写临时，最后重写 header）
+    if (![fm createFileAtPath:outputPath contents:nil attributes:nil]) { completion(NO); return; }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:outputPath];
+    if (!fh) { completion(NO); return; }
+
+    // 先占位 header（44 字节）
+    uint8_t zeros[44] = {0};
+    [fh writeData:[NSData dataWithBytes:zeros length:44]];
+
+    [reader startReading];
+    uint32_t totalBytes = 0;
+    int safety = 0;
+
+    while (reader.status == AVAssetReaderStatusReading) {
+        if (++safety > 500000) { addLog(@"⚠️ 循环保护"); break; }
+
+        CMSampleBufferRef sampleBuffer = [readerOutput copyNextSampleBuffer];
+        if (!sampleBuffer) break;
+
+        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+        if (blockBuffer) {
+            size_t length = CMBlockBufferGetDataLength(blockBuffer);
+            if (length > 0) {
+                uint8_t *buffer = malloc(length);
+                if (buffer) {
+                    CMBlockBufferCopyDataBytes(blockBuffer, 0, length, buffer);
+                    [fh writeData:[NSData dataWithBytes:buffer length:length]];
+                    totalBytes += (uint32_t)length;
+                    free(buffer);
+                }
+            }
+        }
+        CFRelease(sampleBuffer);
+    }
+
+    // 回到文件开头写正确的 header
+    [fh seekToFileOffset:0];
+    writeWAVHeader(fh, totalBytes);
+    [fh closeFile];
+
+    BOOL ok = (reader.status == AVAssetReaderStatusCompleted) && (totalBytes > 0);
+    addLog(@"📊 WAV 转换: %@, 写入 %u 字节", ok ? @"成功" : @"失败", totalBytes);
+    completion(ok);
 }
 
 // ===================== 列表 =====================
@@ -332,12 +355,18 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     return cell;
 }
 
+// 🚨 修复：试听前强制切换为扬声器播放
 - (void)playAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     stopPlayingAudio();
-    sharedAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
-    [sharedAudioPlayer play];
+    setupSpeakerPlayback();
+    NSError *err;
+    sharedAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:&err];
+    if (!err) {
+        sharedAudioPlayer.volume = 1.0;
+        [sharedAudioPlayer play];
+    }
 }
 
 - (void)sendAction:(UIButton *)sender {
@@ -358,9 +387,6 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     }]];
     [actionSheet addAction:[UIAlertAction actionWithTitle:@"重命名" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         [self renameFile:fileName atIndexPath:indexPath];
-    }]];
-    [actionSheet addAction:[UIAlertAction actionWithTitle:@"剪辑" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        [self clipFile:fullPath fileName:fileName atIndexPath:indexPath];
     }]];
     [actionSheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:actionSheet animated:YES completion:nil];
@@ -389,60 +415,6 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)clipFile:(NSString *)fullPath fileName:(NSString *)fileName atIndexPath:(NSIndexPath *)indexPath {
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:fullPath] options:nil];
-    double totalDuration = CMTimeGetSeconds(asset.duration);
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"剪辑音频" message:[NSString stringWithFormat:@"原时长 %.2f 秒\n请输入剪辑时间范围（秒）", totalDuration] preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.placeholder = @"开始时间 (如 0)";
-        textField.keyboardType = UIKeyboardTypeDecimalPad;
-    }];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.placeholder = [NSString stringWithFormat:@"结束时间 (如 %.1f)", totalDuration];
-        textField.keyboardType = UIKeyboardTypeDecimalPad;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        double start = [alert.textFields[0].text doubleValue];
-        double end = [alert.textFields[1].text doubleValue];
-        if (end <= start || start < 0) return;
-
-        NSString *tmpM4a = [getVoicePacksDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"tmp_clip_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
-
-        NativeProgressVC *vc = [[NativeProgressVC alloc] init];
-        [vc setTitle:@"正在剪辑..."];
-        UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"剪辑音频" message:nil preferredStyle:UIAlertControllerStyleAlert];
-        [progressAlert setValue:vc forKey:@"contentViewController"];
-        [progressAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:progressAlert animated:YES completion:nil];
-
-        clipAudio(fullPath, tmpM4a, start, end, ^(BOOL success) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!success) {
-                    [progressAlert dismissViewControllerAnimated:YES completion:nil];
-                    return;
-                }
-                NSString *newName = [NSString stringWithFormat:@"剪辑_%ld.wav", (long)[[NSDate date] timeIntervalSince1970]];
-                NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
-                convertToWAV(tmpM4a, newPath, ^(BOOL ok2) {
-                    [[NSFileManager defaultManager] removeItemAtPath:tmpM4a error:nil];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [progressAlert dismissViewControllerAnimated:YES completion:^{
-                            if (ok2) {
-                                self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                                [self.tableView reloadData];
-                            }
-                        }];
-                    });
-                });
-            });
-        });
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
@@ -462,7 +434,7 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
-// ===================== 视频转语音：带"取消"按钮的进度弹窗 =====================
+// ===================== 视频转语音：手动构建 WAV =====================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -482,66 +454,33 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
             if (!self.view) return;
 
             NativeProgressVC *vc = [[NativeProgressVC alloc] init];
-            [vc setTitle:@"正在提取音频..."];
+            [vc setTitle:@"正在转换..."];
             UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"视频转语音" message:nil preferredStyle:UIAlertControllerStyleAlert];
             [progressAlert setValue:vc forKey:@"contentViewController"];
-
-            __block AVAssetExportSession *cancellableExtractor = nil;
-            __block BOOL cancelled = NO;
-            [progressAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-                cancelled = YES;
-                [cancellableExtractor cancelExport];
-            }]];
+            [progressAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
             [self presentViewController:progressAlert animated:YES completion:nil];
 
-            NSString *tempAudioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"temp_extract.m4a"];
-            if ([fm fileExistsAtPath:tempAudioPath]) [fm removeItemAtPath:tempAudioPath error:nil];
+            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.wav", (long)[[NSDate date] timeIntervalSince1970]];
+            NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tempPath] options:nil];
-            AVAssetExportSession *extractor = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
-            extractor.outputURL = [NSURL fileURLWithPath:tempAudioPath];
-            extractor.outputFileType = AVFileTypeAppleM4A;
-            cancellableExtractor = extractor;
-
-            [extractor exportAsynchronouslyWithCompletionHandler:^{
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (cancelled) return;
-                    if (extractor.status != AVAssetExportSessionStatusCompleted) {
-                        addLog(@"❌ 视频提取失败: %@", extractor.error);
-                        [progressAlert dismissViewControllerAnimated:YES completion:nil];
-                        return;
-                    }
-
-                    [vc setTitle:@"正在转码 (16000Hz WAV)..."];
-
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        if (cancelled) return;
-
-                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.wav", (long)[[NSDate date] timeIntervalSince1970]];
-                        NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-
-                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                            convertToWAV(tempAudioPath, destPath, ^(BOOL success) {
-                                dispatch_async(dispatch_get_main_queue(), ^{
-                                    if (cancelled) return;
-                                    [[NSFileManager defaultManager] removeItemAtPath:tempAudioPath error:nil];
-                                    [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
-                                    [progressAlert dismissViewControllerAnimated:YES completion:^{
-                                        if (success) {
-                                            self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
-                                            [self.tableView reloadData];
-                                        } else {
-                                            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"转换失败" message:@"视频可能没有音频轨道或格式不支持" preferredStyle:UIAlertControllerStyleAlert];
-                                            [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                                            [self presentViewController:a animated:YES completion:nil];
-                                        }
-                                    }];
-                                });
-                            });
-                        });
+            // 🚨 后台线程执行，绝不卡 UI
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                convertVideoToWAV(tempPath, destPath, ^(BOOL success) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
+                        [progressAlert dismissViewControllerAnimated:YES completion:^{
+                            if (success) {
+                                self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
+                                [self.tableView reloadData];
+                            } else {
+                                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"转换失败" message:@"视频可能没有音频轨道" preferredStyle:UIAlertControllerStyleAlert];
+                                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                                [self presentViewController:a animated:YES completion:nil];
+                            }
+                        }];
                     });
                 });
-            }];
+            });
         });
     }];
 }
