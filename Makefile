@@ -6,5 +6,5 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = UniversalSpy
 UniversalSpy_FILES = Tweak.x
 UniversalSpy_CFLAGS = -fobjc-arc
-UniversalSpy_FRAMEWORKS = UIKit Foundation AVFoundation PhotosUI UniformTypeIdentifiers
+UniversalSpy_FRAMEWORKS = UIKit Foundation AVFoundation
 include $(THEOS_MAKE_PATH)/tweak.mk
