@@ -15,6 +15,7 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
 
+// ===================== 目录 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -24,6 +25,57 @@ static NSString *getVoicePacksDirectory() {
     return voiceDir;
 }
 
+// ===================== 日志系统：写入 VoicePacks/debug.log =====================
+static void addLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSString *time = [fmt stringFromDate:[NSDate date]];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", time, msg];
+
+    NSLog(@"[VoicePlugin] %@", msg);
+
+    NSString *logPath = [getVoicePacksDirectory() stringByAppendingPathComponent:@"debug.log"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:logPath]) {
+        [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+}
+
+// ===================== 音频信息 =====================
+static NSString *audioInfo(NSString *path) {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    double duration = CMTimeGetSeconds(asset.duration);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"大小=%.2fKB, 时长=%.2fs",
+                          [attrs fileSize] / 1024.0, duration];
+
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!track) {
+        [s appendString:@", 无音频轨道"];
+        return s;
+    }
+    for (id desc in track.formatDescriptions) {
+        CMAudioFormatDescriptionRef fmt = (__bridge CMAudioFormatDescriptionRef)desc;
+        const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+        if (asbd) {
+            [s appendFormat:@", 采样率=%.0fHz, 声道=%u, 格式ID=%u",
+                asbd->mSampleRate, asbd->mChannelsPerFrame, (unsigned int)asbd->mFormatID];
+        }
+    }
+    return s;
+}
+
+// ===================== 通用工具 =====================
 static NSArray<NSString *> *getAllVoiceFiles() {
     NSError *error;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:getVoicePacksDirectory() error:&error];
@@ -31,7 +83,7 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     NSMutableArray *voiceFiles = [NSMutableArray array];
     for (NSString *file in files) {
         NSString *lower = [file lowercaseString];
-        if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"] || [lower hasSuffix:@".amr"]) {
+        if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"]) {
             [voiceFiles addObject:file];
         }
     }
@@ -69,122 +121,80 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 记录 App 自己录音的格式（用于诊断） =====================
-static NSString *g_lastRecordPath = nil;
-
-%hook CWRecorder
-- (NSString *)recordPath {
-    NSString *path = %orig;
-    if (path && path.length > 0) {
-        g_lastRecordPath = path;
-        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-        NSLog(@"[VoicePlugin] App 录音文件: %@, 大小: %llu 字节", path, [attrs fileSize]);
-    }
-    return path;
-}
-%end
-
-// ===================== 转码：用 App 录音的 CAF 格式 =====================
-// 关键：不指定过于苛刻的参数，用 App 自己用的 .caf 容器 + AAC 编码
-static void convertToCAF(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
+// ===================== 转码 =====================
+static void convertToM4A(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
-    NSURL *inputURL = [NSURL fileURLWithPath:inputPath];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inputURL options:nil];
-    AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!audioTrack) {
-        NSLog(@"[VoicePlugin] 无音频轨道");
-        completion(NO);
-        return;
-    }
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:inputPath] options:nil];
+    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    session.outputURL = [NSURL fileURLWithPath:outputPath];
+    session.outputFileType = AVFileTypeAppleM4A;
 
-    NSError *error = nil;
-    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (error || !reader) { completion(NO); return; }
-
-    NSDictionary *readerSettings = @{
-        AVFormatIDKey: @(kAudioFormatLinearPCM),
-        AVLinearPCMIsFloatKey: @NO,
-        AVLinearPCMBitDepthKey: @16,
-        AVLinearPCMIsNonInterleaved: @NO,
-        AVLinearPCMIsBigEndianKey: @NO,
-    };
-    AVAssetReaderTrackOutput *readerOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:readerSettings];
-    readerOutput.alwaysCopiesSampleData = NO;
-    if (![reader canAddOutput:readerOutput]) { completion(NO); return; }
-    [reader addOutput:readerOutput];
-
-    // 🚨 关键：输出为 .caf 容器 + AAC 编码，与 App 自己录音格式一致
-    NSDictionary *writerSettings = @{
-        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @44100,
-        AVNumberOfChannelsKey: @1,
-        AVEncoderBitRateKey: @64000,
-    };
-    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeCoreAudioFormat error:&error];
-    if (error || !writer) {
-        NSLog(@"[VoicePlugin] writer 创建失败: %@", error);
-        completion(NO);
-        return;
-    }
-
-    AVAssetWriterInput *writerInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:writerSettings];
-    writerInput.expectsMediaDataInRealTime = NO;
-    if (![writer canAddInput:writerInput]) { completion(NO); return; }
-    [writer addInput:writerInput];
-
-    [reader startReading];
-    [writer startWriting];
-    [writer startSessionAtSourceTime:kCMTimeZero];
-
-    dispatch_queue_t queue = dispatch_queue_create("com.voiceplugin.convert", DISPATCH_QUEUE_SERIAL);
-    [writerInput requestMediaDataWhenReadyOnQueue:queue usingBlock:^{
-        while ([writerInput isReadyForMoreMediaData]) {
-            CMSampleBufferRef buffer = [readerOutput copyNextSampleBuffer];
-            if (!buffer) {
-                [writerInput markAsFinished];
-                [writer finishWritingWithCompletionHandler:^{
-                    BOOL ok = (writer.status == AVAssetWriterStatusCompleted);
-                    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-                    NSLog(@"[VoicePlugin] CAF 转码: %@, 大小: %llu 字节", ok ? @"成功" : @"失败", [attrs fileSize]);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        completion(ok);
-                    });
-                }];
-                return;
+    [session exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL ok = (session.status == AVAssetExportSessionStatusCompleted);
+            if (!ok) {
+                addLog(@"❌ 转码失败: status=%ld, error=%@", (long)session.status, session.error);
             }
-            [writerInput appendSampleBuffer:buffer];
-            CFRelease(buffer);
-        }
+            completion(ok);
+        });
     }];
 }
 
-// ===================== 发送核心 =====================
+// ===================== 发送核心（每一步都记日志） =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
+
+    addLog(@"========== 开始发送 ==========");
+
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
-        NSLog(@"[VoicePlugin] 源文件不存在");
+        addLog(@"❌ 源文件不存在: %@", sourcePath);
         return;
     }
 
-    UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) { NSLog(@"[VoicePlugin] 无聊天控制器"); return; }
+    addLog(@"📁 源文件: %@", sourcePath);
+    addLog(@"📊 源文件信息: %@", audioInfo(sourcePath));
 
-    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.caf", (long)[[NSDate date] timeIntervalSince1970]]];
+    UIViewController *chatVC = findMessageDetailController(topViewController());
+    if (!chatVC) {
+        addLog(@"❌ 找不到聊天控制器");
+        return;
+    }
+    addLog(@"✅ 聊天控制器: %@", NSStringFromClass([chatVC class]));
+
+    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
-    NSLog(@"[VoicePlugin] 准备发送: %@, 时长: %d秒", sourcePath, duration);
 
-    convertToCAF(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) { NSLog(@"[VoicePlugin] 转码失败"); return; }
+    convertToM4A(sourcePath, outputPath, ^(BOOL success) {
+        if (!success) {
+            addLog(@"❌ 转码失败，中止发送");
+            return;
+        }
+
+        addLog(@"📁 转码输出: %@", outputPath);
+        addLog(@"📊 转码输出信息: %@", audioInfo(outputPath));
+
+        // 本地播放验证
+        NSError *playErr = nil;
+        AVAudioPlayer *verifyPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:outputPath] error:&playErr];
+        if (playErr || !verifyPlayer) {
+            addLog(@"❌ 本地播放器加载失败: %@", playErr);
+            return;
+        }
+        addLog(@"✅ 本地播放器识别时长: %.2f 秒", verifyPlayer.duration);
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
         SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) return;
+        if (![manager respondsToSelector:createSel]) {
+            addLog(@"❌ V2TIMManager 不支持 createSoundMessage");
+            return;
+        }
 
         NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
         NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -197,19 +207,24 @@ static void sendVoice(NSString *sourcePath) {
 
         __unsafe_unretained id msg = nil;
         [inv getReturnValue:&msg];
+        addLog(@"✅ 消息构造: %@", msg ? @"成功" : @"失败");
 
         SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if ([chatVC respondsToSelector:sendSel]) {
-            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-            [sendInv setTarget:chatVC];
-            [sendInv setSelector:sendSel];
-            [sendInv setArgument:&msg atIndex:2];
-            BOOL retry = NO;
-            [sendInv setArgument:&retry atIndex:3];
-            [sendInv invoke];
-            NSLog(@"[VoicePlugin] 发送指令已执行");
+        if (![chatVC respondsToSelector:sendSel]) {
+            addLog(@"❌ 聊天控制器不支持 sendMessage:isRetry:");
+            return;
         }
+
+        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+        [sendInv setTarget:chatVC];
+        [sendInv setSelector:sendSel];
+        [sendInv setArgument:&msg atIndex:2];
+        BOOL retry = NO;
+        [sendInv setArgument:&retry atIndex:3];
+        [sendInv invoke];
+        addLog(@"✅ 已调用 sendMessage:isRetry:，发送完成");
+        addLog(@"========== 流程结束 ==========");
     });
 }
 
@@ -231,11 +246,18 @@ static void sendVoice(NSString *sourcePath) {
     UIBarButtonItem *space1 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
     UIBarButtonItem *space2 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
     self.toolbarItems = @[videoBtn, space1, importBtn, space2];
+
+    addLog(@"列表打开，找到 %lu 个语音文件", (unsigned long)self.files.count);
 }
 
-- (void)close { stopPlayingAudio(); [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)close {
+    stopPlayingAudio();
+    addLog(@"用户取消");
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
 
 - (void)videoAction {
+    addLog(@"点击视频转语音");
     PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
     config.filter = PHPickerFilter.videosFilter;
     config.selectionLimit = 1;
@@ -245,6 +267,7 @@ static void sendVoice(NSString *sourcePath) {
 }
 
 - (void)importAction {
+    addLog(@"点击导入语音包");
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
@@ -286,6 +309,7 @@ static void sendVoice(NSString *sourcePath) {
 - (void)playAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+    addLog(@"试听: %@", fileName);
     stopPlayingAudio();
     sharedAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
     [sharedAudioPlayer play];
@@ -294,6 +318,7 @@ static void sendVoice(NSString *sourcePath) {
 - (void)sendAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+    addLog(@"点击发送: %@", fileName);
     [self dismissViewControllerAnimated:YES completion:^{
         sendVoice(path);
     }];
@@ -303,6 +328,7 @@ static void sendVoice(NSString *sourcePath) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSString *fileName = self.files[indexPath.row];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
+    addLog(@"点击列表项: %@", fileName);
     [self dismissViewControllerAnimated:YES completion:^{
         sendVoice(path);
     }];
@@ -310,20 +336,31 @@ static void sendVoice(NSString *sourcePath) {
 
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    if (results.count == 0) return;
+    if (results.count == 0) {
+        addLog(@"视频选择取消");
+        return;
+    }
+    addLog(@"选中视频，开始转码");
     PHPickerResult *result = results.firstObject;
     if ([result.itemProvider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [result.itemProvider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) return;
+            if (error || !url) {
+                addLog(@"加载视频失败: %@", error);
+                return;
+            }
             NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:url.lastPathComponent];
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
             [fm copyItemAtPath:url.path toPath:tempPath error:&error];
-            if (error) return;
-            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.caf", (long)[[NSDate date] timeIntervalSince1970]];
+            if (error) {
+                addLog(@"复制视频失败: %@", error);
+                return;
+            }
+            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-            convertToCAF(tempPath, destPath, ^(BOOL success) {
+            convertToM4A(tempPath, destPath, ^(BOOL success) {
                 if (success) {
+                    addLog(@"视频转语音成功: %@", destName);
                     self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
                     [self.tableView reloadData];
                 }
@@ -333,25 +370,32 @@ static void sendVoice(NSString *sourcePath) {
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    if (urls.count == 0) return;
+    if (urls.count == 0) {
+        addLog(@"文件选择取消");
+        return;
+    }
     NSURL *url = urls.firstObject;
+    addLog(@"导入文件: %@", url.lastPathComponent);
     NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:url.lastPathComponent];
     [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
     NSError *error;
     [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:destPath error:&error];
     if (!error) {
+        addLog(@"导入成功");
         self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
         [self.tableView reloadData];
+    } else {
+        addLog(@"导入失败: %@", error);
     }
 }
 
 @end
 
-// ===================== 方案 C 核心 =====================
+// ===================== 方案 C：拦截松手，弹出列表 =====================
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
-    NSLog(@"[VoicePlugin] 松手触发，弹出列表");
+    addLog(@"拦截到 sendRecorde，弹出语音列表");
 
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
