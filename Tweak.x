@@ -32,7 +32,7 @@ static ProgressHUD *g_hud = nil;
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
         self.layer.cornerRadius = 12;
 
         _titleLabel = [[UILabel alloc] init];
@@ -69,7 +69,6 @@ static ProgressHUD *g_hud = nil;
     [view addSubview:self];
     [view bringSubviewToFront:self];
 
-    // 每 0.1 秒刷新一次进度
     [self.timer invalidate];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
@@ -466,7 +465,6 @@ static void sendVoice(NSString *sourcePath) {
         NSString *newName = [NSString stringWithFormat:@"剪辑_%.0f_%@", [[NSDate date] timeIntervalSince1970], fileName];
         NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
 
-        // 🚨 显示进度条
         [[ProgressHUD shared] showOnView:self.view title:@"正在剪辑..."];
         clipAudio(fullPath, newPath, start, end, ^(BOOL success) {
             [[ProgressHUD shared] dismiss];
@@ -483,7 +481,8 @@ static void sendVoice(NSString *sourcePath) {
     NSString *fileName = self.files[indexPath.row];
     NSString *fullPath = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
 
-    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithTitle:@"删除" style:UIContextualActionStyleDestructive handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
+    // 🚨 修复：正确的方法是 contextualActionWithStyle:title:handler:
+    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction * _Nonnull action, __kindof UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"确认删除" message:[NSString stringWithFormat:@"确定要删除“%@”吗？", fileName] preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) { completionHandler(NO); }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
@@ -498,7 +497,6 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
-// 🚨 视频转语音：带进度条
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -520,19 +518,16 @@ static void sendVoice(NSString *sourcePath) {
             extractor.outputURL = [NSURL fileURLWithPath:tempAudioPath];
             extractor.outputFileType = AVFileTypeAppleM4A;
 
-            // 🚨 显示进度条并开始追踪
             [[ProgressHUD shared] showOnView:self.view title:@"正在提取音频..."];
             [[ProgressHUD shared] trackSession:extractor];
 
             [extractor exportAsynchronouslyWithCompletionHandler:^{
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (extractor.status != AVAssetExportSessionStatusCompleted) {
-                        addLog(@"❌ 视频提取音频失败: %@", extractor.error);
                         [[ProgressHUD shared] dismiss];
                         return;
                     }
 
-                    // 提取完成，进入转码阶段
                     [[ProgressHUD shared] updateProgress:1.0];
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         [[ProgressHUD shared] showOnView:self.view title:@"正在转码..."];
@@ -544,11 +539,8 @@ static void sendVoice(NSString *sourcePath) {
                             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                                 [[ProgressHUD shared] dismiss];
                                 if (success) {
-                                    addLog(@"✅ 视频转语音成功: %@", destName);
                                     self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
                                     [self.tableView reloadData];
-                                } else {
-                                    addLog(@"❌ 视频转语音最终转码失败");
                                 }
                             });
                         });
