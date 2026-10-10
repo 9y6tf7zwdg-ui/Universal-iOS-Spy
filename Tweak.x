@@ -4,7 +4,6 @@
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// ===================== 原生进度弹窗 =====================
 @interface NativeProgressVC : UIViewController
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *titleLabel;
@@ -39,9 +38,7 @@
     ]];
 }
 
-- (void)setTitle:(NSString *)title {
-    _titleLabel.text = title;
-}
+- (void)setTitle:(NSString *)title { _titleLabel.text = title; }
 
 - (void)startTrackingSession:(AVAssetExportSession *)session {
     self.session = session;
@@ -53,17 +50,13 @@
     @try {
         if (self.session && self.session.status == AVAssetExportSessionStatusExporting) {
             float p = self.session.progress;
-            if (p > 0 && p <= 1.0) {
-                [self.progressView setProgress:p animated:YES];
-            }
+            if (p > 0 && p <= 1.0) [self.progressView setProgress:p animated:YES];
         }
     } @catch (NSException *e) {}
 }
 
 - (void)setProgress:(float)p {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.progressView setProgress:p animated:YES];
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self.progressView setProgress:p animated:YES]; });
 }
 
 - (void)stopTracking {
@@ -76,7 +69,6 @@
 
 @end
 
-// ===================== 声明 =====================
 @interface MessageDetailController : UIViewController
 @end
 
@@ -88,7 +80,6 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *files;
 @end
 
-// ===================== 工具 =====================
 static NSString *getVoicePacksDirectory() {
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
@@ -166,7 +157,7 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 转码 AAC =====================
+// ===================== 转码：8000Hz 单声道 AAC（输出 m4a 容器） =====================
 static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -225,7 +216,6 @@ static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^compl
     }
 }
 
-// ===================== 剪辑 =====================
 static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval start, NSTimeInterval end, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
@@ -243,7 +233,6 @@ static void clipAudio(NSString *sourcePath, NSString *outputPath, NSTimeInterval
     }];
 }
 
-// ===================== 发送 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
     if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
@@ -251,8 +240,9 @@ static void sendVoice(NSString *sourcePath) {
     UIViewController *chatVC = findMessageDetailController(topViewController());
     if (!chatVC) return;
 
+    // 🚨 输出 m4a（不是 aac），避免容器损坏
     NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"send_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]]];
+                            [NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
@@ -293,7 +283,6 @@ static void sendVoice(NSString *sourcePath) {
     });
 }
 
-// ===================== 列表 =====================
 @implementation VoicePackListVC
 
 - (void)viewDidLoad {
@@ -438,7 +427,6 @@ static void sendVoice(NSString *sourcePath) {
         NSString *newName = [NSString stringWithFormat:@"剪辑_%.0f_%@", [[NSDate date] timeIntervalSince1970], fileName];
         NSString *newPath = [getVoicePacksDirectory() stringByAppendingPathComponent:newName];
 
-        // 🚨 用系统原生的 Alert + ProgressView 显示进度
         NativeProgressVC *vc = [[NativeProgressVC alloc] init];
         [vc setTitle:@"正在剪辑..."];
         UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"正在处理" message:nil preferredStyle:UIAlertControllerStyleAlert];
@@ -477,7 +465,6 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
-// 🚨 视频转语音：系统原生进度弹窗
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
@@ -496,14 +483,12 @@ static void sendVoice(NSString *sourcePath) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!self.view) return;
 
-            // 1. 弹出系统原生进度 Alert
             NativeProgressVC *vc = [[NativeProgressVC alloc] init];
             [vc setTitle:@"正在提取音频..."];
             UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"视频转语音" message:nil preferredStyle:UIAlertControllerStyleAlert];
             [progressAlert setValue:vc forKey:@"contentViewController"];
             [self presentViewController:progressAlert animated:YES completion:nil];
 
-            // 2. 提取音频
             NSString *tempAudioPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"temp_extract.m4a"];
             if ([fm fileExistsAtPath:tempAudioPath]) [fm removeItemAtPath:tempAudioPath error:nil];
 
@@ -521,16 +506,15 @@ static void sendVoice(NSString *sourcePath) {
                         return;
                     }
 
-                    // 3. 切换到转码阶段
                     [vc setProgress:1.0];
                     [vc setTitle:@"正在转码..."];
                     [vc stopTracking];
 
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]];
+                        // 🚨 输出 .m4a，不是 .aac
+                        NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
                         NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
 
-                        // 转码用菊花转圈（因为 AVAudioConverter 没有进度回调）
                         UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
                         spinner.frame = CGRectMake(125, 60, 20, 20);
                         [vc.view addSubview:spinner];
