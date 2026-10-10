@@ -111,7 +111,6 @@ static BOOL convertVideoToVoicePackWAV(NSString *videoPath, NSString *outputPath
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
     if (error || !reader) { addLog(@"❌ reader 失败: %@", error); return NO; }
 
-    // 🚨 关键：读取阶段就指定 16kHz 单声道 16bit PCM
     NSDictionary *outputSettings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
         AVSampleRateKey: @(16000.0),
@@ -145,7 +144,6 @@ static BOOL convertVideoToVoicePackWAV(NSString *videoPath, NSString *outputPath
 
     if (pcmData.length == 0) { addLog(@"❌ 提取 PCM 为空"); return NO; }
 
-    // 🚨 手动构造 WAV 头（和早上好.wav 一模一样的结构）
     NSMutableData *wavData = [NSMutableData data];
     uint32_t chunkSize = 36 + (uint32_t)pcmData.length;
     uint32_t format = 0x45564157;  // 'WAVE'
@@ -182,113 +180,66 @@ static BOOL convertVideoToVoicePackWAV(NSString *videoPath, NSString *outputPath
     return YES;
 }
 
-// ===================== 发送：黄金版本，锁死不动 =====================
-static void convertToAAC(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
-
-    @autoreleasepool {
-        NSError *error = nil;
-        AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:inputPath] error:&error];
-        if (error || !inFile) { addLog(@"❌ 读取源文件失败: %@", error); completion(NO); return; }
-
-        NSDictionary *outSettings = @{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @8000,
-            AVNumberOfChannelsKey: @1,
-            AVEncoderBitRateKey: @16000,
-        };
-
-        AVAudioFile *outFile = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:outputPath]
-                                                          settings:outSettings
-                                                     commonFormat:AVAudioPCMFormatInt16
-                                                      interleaved:NO
-                                                            error:&error];
-        if (error || !outFile) { addLog(@"❌ 创建 AAC 失败: %@", error); completion(NO); return; }
-
-        AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFile.processingFormat toFormat:outFile.processingFormat];
-        if (!converter) { addLog(@"❌ Converter 失败"); outFile = nil; completion(NO); return; }
-
-        AVAudioFrameCount capacity = 4096;
-        AVAudioPCMBuffer *inBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFile.processingFormat frameCapacity:capacity];
-        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFile.processingFormat frameCapacity:capacity];
-
-        BOOL writeError = NO;
-        int safety = 0;
-        while (1) {
-            if (++safety > 500000) { addLog(@"⚠️ AAC 循环保护"); break; }
-            NSError *convError = nil;
-            AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuf error:&convError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus * _Nonnull outStatus) {
-                NSError *readError = nil;
-                [inFile readIntoBuffer:inBuf error:&readError];
-                if (readError || inBuf.frameLength == 0) {
-                    *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                    return nil;
-                }
-                *outStatus = AVAudioConverterInputStatus_HaveData;
-                return inBuf;
-            }];
-            if (status == AVAudioConverterOutputStatus_Error) { addLog(@"❌ AAC 转换错误: %@", convError); writeError = YES; break; }
-            if (outBuf.frameLength > 0) {
-                NSError *writeErr = nil;
-                [outFile writeFromBuffer:outBuf error:&writeErr];
-                if (writeErr) { addLog(@"❌ AAC 写入错误: %@", writeErr); writeError = YES; break; }
-            }
-            if (status == AVAudioConverterOutputStatus_EndOfStream) break;
-        }
-        outFile = nil;
-        inFile = nil;
-        completion(!writeError);
-    }
-}
-
+// ===================== 发送：跳过转码，强制发送源文件 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
+        addLog(@"❌ 源文件不存在或路径为空: %@", sourcePath);
+        return;
+    }
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) return;
+    if (!chatVC) {
+        addLog(@"❌ 找不到 MessageDetailController");
+        return;
+    }
 
-    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"send_%ld.aac", (long)[[NSDate date] timeIntervalSince1970]]];
-
+    // 详细的发送前诊断
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:sourcePath error:nil];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
+    
+    addLog(@"🚀 准备发送源文件: %@", sourcePath.lastPathComponent);
+    addLog(@"📊 文件大小: %llu 字节, 计算时长: %d 秒", [attrs fileSize], duration);
+    addLog(@"🎵 音频轨道数: %lu", (unsigned long)[asset tracksWithMediaType:AVMediaTypeAudio].count);
 
-    convertToAAC(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) return;
+    // 原发送逻辑
+    Class v2Mgr = NSClassFromString(@"V2TIMManager");
+    id manager = [v2Mgr performSelector:@selector(sharedInstance)];
+    SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
+    if (![manager respondsToSelector:createSel]) {
+        addLog(@"❌ V2TIMManager 不响应 createSoundMessage:duration:");
+        return;
+    }
 
-        Class v2Mgr = NSClassFromString(@"V2TIMManager");
-        id manager = [v2Mgr performSelector:@selector(sharedInstance)];
-        SEL createSel = NSSelectorFromString(@"createSoundMessage:duration:");
-        if (![manager respondsToSelector:createSel]) return;
+    NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:manager];
+    [inv setSelector:createSel];
+    __unsafe_unretained NSString *pathArg = sourcePath;
+    [inv setArgument:&pathArg atIndex:2];
+    [inv setArgument:&duration atIndex:3];
+    [inv invoke];
 
-        NSMethodSignature *sig = [manager methodSignatureForSelector:createSel];
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        [inv setTarget:manager];
-        [inv setSelector:createSel];
-        __unsafe_unretained NSString *pathArg = outputPath;
-        [inv setArgument:&pathArg atIndex:2];
-        [inv setArgument:&duration atIndex:3];
-        [inv invoke];
+    __unsafe_unretained id msg = nil;
+    [inv getReturnValue:&msg];
+    addLog(@"📨 创建消息结果: %@", msg);
 
-        __unsafe_unretained id msg = nil;
-        [inv getReturnValue:&msg];
-
-        SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
-        if ([chatVC respondsToSelector:sendSel]) {
-            NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
-            NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
-            [sendInv setTarget:chatVC];
-            [sendInv setSelector:sendSel];
-            [sendInv setArgument:&msg atIndex:2];
-            BOOL retry = NO;
-            [sendInv setArgument:&retry atIndex:3];
-            [sendInv invoke];
-        }
-        [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
-    });
+    SEL sendSel = NSSelectorFromString(@"sendMessage:isRetry:");
+    if ([chatVC respondsToSelector:sendSel]) {
+        NSMethodSignature *sendSig = [chatVC methodSignatureForSelector:sendSel];
+        NSInvocation *sendInv = [NSInvocation invocationWithMethodSignature:sendSig];
+        [sendInv setTarget:chatVC];
+        [sendInv setSelector:sendSel];
+        [sendInv setArgument:&msg atIndex:2];
+        BOOL retry = NO;
+        [sendInv setArgument:&retry atIndex:3];
+        [sendInv invoke];
+        addLog(@"✅ 已调用 sendMessage:isRetry:");
+    } else {
+        addLog(@"❌ MessageDetailController 不响应 sendMessage:isRetry:");
+    }
 }
 
 // ===================== 列表 =====================
@@ -304,8 +255,8 @@ static void sendVoice(NSString *sourcePath) {
     self.navigationController.toolbarHidden = NO;
     UIBarButtonItem *videoBtn = [[UIBarButtonItem alloc] initWithTitle:@"视频转语音" style:UIBarButtonItemStylePlain target:self action:@selector(videoAction)];
     UIBarButtonItem *importBtn = [[UIBarButtonItem alloc] initWithTitle:@"导入语音包" style:UIBarButtonItemStylePlain target:self action:@selector(importAction)];
-    UIBarButtonItem *space1 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
-    UIBarButtonItem *space2 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *space1 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *space2 = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleFlexibleSpace target:nil action:nil];
     self.toolbarItems = @[videoBtn, space1, importBtn, space2];
 }
 
@@ -355,14 +306,61 @@ static void sendVoice(NSString *sourcePath) {
     return cell;
 }
 
+// 🚨 这里加入了极详尽的诊断日志，专门排查为什么试听没声音
 - (void)playAction:(UIButton *)sender {
     NSString *fileName = self.files[sender.tag];
     NSString *path = [getVoicePacksDirectory() stringByAppendingPathComponent:fileName];
     stopPlayingAudio();
     setupSpeakerPlayback();
-    NSError *err;
+    
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL exists = [fm fileExistsAtPath:path];
+    BOOL readable = [fm isReadableFileAtPath:path];
+    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+
+    addLog(@"🎵 ==================== 开始试听 ====================");
+    addLog(@"🎵 文件名: %@", fileName);
+    addLog(@"📁 绝对路径: %@", path);
+    addLog(@"📂 文件是否存在: %@", exists ? @"YES" : @"NO");
+    addLog(@"🔐 是否可读: %@", readable ? @"YES" : @"NO");
+    addLog(@"⚖️ 文件大小: %llu 字节", [attrs fileSize]);
+    addLog(@"🔑 文件权限: %@", attrs[NSFilePosixPermissions] ?: @"未知");
+    addLog(@"👤 文件所有者: %@", attrs[NSFileOwnerAccountName] ?: @"未知");
+
+    // 检查 AVAudioSession 当前状态
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    addLog(@"🔊 音频会话类别: %@", session.category);
+    addLog(@"🔊 音频会话是否活跃: %@", session.isActive ? @"YES" : @"NO");
+    addLog(@"🔊 音频会话采样率: %.2f", session.sampleRate);
+    addLog(@"🔊 音频会话输出声道数: %lu", (unsigned long)session.outputNumberOfChannels);
+    addLog(@"🔊 当前输出设备: %@", session.currentRoute.outputs.firstObject.portName ?: @"未知");
+
+    // 尝试通过 AVAsset 预检文件
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    addLog(@"📊 AVAsset 解析时长: %.2f 秒", CMTimeGetSeconds(asset.duration));
+    addLog(@"📊 AVAsset 音频轨道数: %lu", (unsigned long)[asset tracksWithMediaType:AVMediaTypeAudio].count);
+
+    NSError *err = nil;
     sharedAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:&err];
-    if (!err) { sharedAudioPlayer.volume = 1.0; [sharedAudioPlayer play]; }
+    if (err) {
+        addLog(@"❌ AVAudioPlayer 初始化失败: %@", err);
+        addLog(@"❌ 错误 Domain: %@, Code: %ld", err.domain, (long)err.code);
+        return;
+    }
+    if (!sharedAudioPlayer) {
+        addLog(@"❌ AVAudioPlayer 为 nil，未知原因");
+        return;
+    }
+
+    addLog(@"▶️ 播放器初始化成功。持续时长: %.2f 秒, 声道数: %lu", sharedAudioPlayer.duration, (unsigned long)sharedAudioPlayer.numberOfChannels);
+    sharedAudioPlayer.volume = 1.0;
+    BOOL playResult = [sharedAudioPlayer play];
+    addLog(@"▶️ play 方法返回: %@", playResult ? @"YES" : @"NO");
+
+    // 延迟检查是否真的在播放
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        addLog(@"⏱️ 1秒后检查播放器状态 - isPlaying: %@, currentTime: %.2f", sharedAudioPlayer.isPlaying ? @"YES" : @"NO", sharedAudioPlayer.currentTime);
+    });
 }
 
 - (void)sendAction:(UIButton *)sender {
@@ -389,7 +387,7 @@ static void sendVoice(NSString *sourcePath) {
     return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
 }
 
-// ===================== 视频转语音：抄自早上好.wav 生成源码 =====================
+// ===================== 视频转语音 =====================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) { addLog(@"视频选择取消"); return; }
@@ -412,7 +410,6 @@ static void sendVoice(NSString *sourcePath) {
 
         addLog(@"开始转换: %@", destName);
 
-        // 🚨 后台线程执行，避免卡 UI
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             BOOL ok = convertVideoToVoicePackWAV(tempPath, destPath);
             [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
@@ -457,22 +454,15 @@ static void sendVoice(NSString *sourcePath) {
 }
 %end
 
-// ===================== 新增：监测原生录音路径 =====================
+// ===================== 监测原生录音路径 =====================
 %hook V2TIMManager
 
 - (id)createSoundMessage:(NSString *)soundPath duration:(int)duration {
-    // 1. 构造要写入的日志内容
     NSString *logMsg = [NSString stringWithFormat:@"\n=== 🎯 拦截到 createSoundMessage ===\n路径: %@\n时长: %d 秒\n==============================\n", soundPath, duration];
-    
-    // 2. 定位到沙盒路径
     NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *voiceDir = [docPath stringByAppendingPathComponent:@"VoicePacks"];
     NSString *logPath = [voiceDir stringByAppendingPathComponent:@"path_tracker.log"];
-    
-    // 3. 确保目录存在
     [[NSFileManager defaultManager] createDirectoryAtPath:voiceDir withIntermediateDirectories:YES attributes:nil error:nil];
-    
-    // 4. 追加写入日志
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:logPath]) {
         [logMsg writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -482,8 +472,6 @@ static void sendVoice(NSString *sourcePath) {
         [fh writeData:[logMsg dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     }
-    
-    // 5. 原封不动放行，绝不干扰 App 原有逻辑
     return %orig;
 }
 %end
