@@ -31,7 +31,7 @@ static NSArray<NSString *> *getAllVoiceFiles() {
     NSMutableArray *voiceFiles = [NSMutableArray array];
     for (NSString *file in files) {
         NSString *lower = [file lowercaseString];
-        if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"]) {
+        if ([lower hasSuffix:@".wav"] || [lower hasSuffix:@".mp3"] || [lower hasSuffix:@".m4a"] || [lower hasSuffix:@".caf"] || [lower hasSuffix:@".amr"]) {
             [voiceFiles addObject:file];
         }
     }
@@ -69,10 +69,24 @@ static void stopPlayingAudio() {
     sharedAudioPlayer = nil;
 }
 
-// ===================== 精准转码：输出 16kHz 单声道 AAC =====================
-// 腾讯云 IM 推荐音频格式。用 AVAssetWriter 精确控制输出参数，
-// 避免 AVAssetExportSession 沿用视频原始音轨的采样率导致无法播放。
-static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
+// ===================== 记录 App 自己录音的格式（用于诊断） =====================
+static NSString *g_lastRecordPath = nil;
+
+%hook CWRecorder
+- (NSString *)recordPath {
+    NSString *path = %orig;
+    if (path && path.length > 0) {
+        g_lastRecordPath = path;
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        NSLog(@"[VoicePlugin] App 录音文件: %@, 大小: %llu 字节", path, [attrs fileSize]);
+    }
+    return path;
+}
+%end
+
+// ===================== 转码：用 App 录音的 CAF 格式 =====================
+// 关键：不指定过于苛刻的参数，用 App 自己用的 .caf 容器 + AAC 编码
+static void convertToCAF(NSString *inputPath, NSString *outputPath, void (^completion)(BOOL success)) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
@@ -80,7 +94,7 @@ static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^c
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inputURL options:nil];
     AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
     if (!audioTrack) {
-        NSLog(@"[VoicePlugin] 源文件没有音频轨道");
+        NSLog(@"[VoicePlugin] 无音频轨道");
         completion(NO);
         return;
     }
@@ -89,7 +103,6 @@ static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^c
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
     if (error || !reader) { completion(NO); return; }
 
-    // 读取为 PCM 16bit
     NSDictionary *readerSettings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
         AVLinearPCMIsFloatKey: @NO,
@@ -102,15 +115,19 @@ static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^c
     if (![reader canAddOutput:readerOutput]) { completion(NO); return; }
     [reader addOutput:readerOutput];
 
-    // 输出为 16kHz 单声道 AAC
+    // 🚨 关键：输出为 .caf 容器 + AAC 编码，与 App 自己录音格式一致
     NSDictionary *writerSettings = @{
         AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @16000,
+        AVSampleRateKey: @44100,
         AVNumberOfChannelsKey: @1,
-        AVEncoderBitRateKey: @32000,
+        AVEncoderBitRateKey: @64000,
     };
-    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeAppleM4A error:&error];
-    if (error || !writer) { completion(NO); return; }
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeCoreAudioFormat error:&error];
+    if (error || !writer) {
+        NSLog(@"[VoicePlugin] writer 创建失败: %@", error);
+        completion(NO);
+        return;
+    }
 
     AVAssetWriterInput *writerInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:writerSettings];
     writerInput.expectsMediaDataInRealTime = NO;
@@ -130,7 +147,7 @@ static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^c
                 [writer finishWritingWithCompletionHandler:^{
                     BOOL ok = (writer.status == AVAssetWriterStatusCompleted);
                     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outputPath error:nil];
-                    NSLog(@"[VoicePlugin] 转码结果: %@, 文件大小: %llu 字节", ok ? @"成功" : @"失败", [attrs fileSize]);
+                    NSLog(@"[VoicePlugin] CAF 转码: %@, 大小: %llu 字节", ok ? @"成功" : @"失败", [attrs fileSize]);
                     dispatch_async(dispatch_get_main_queue(), ^{
                         completion(ok);
                     });
@@ -146,23 +163,23 @@ static void convertToIMAudio(NSString *inputPath, NSString *outputPath, void (^c
 // ===================== 发送核心 =====================
 static void sendVoice(NSString *sourcePath) {
     stopPlayingAudio();
-    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) return;
+    if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
+        NSLog(@"[VoicePlugin] 源文件不存在");
+        return;
+    }
 
     UIViewController *chatVC = findMessageDetailController(topViewController());
-    if (!chatVC) { NSLog(@"[VoicePlugin] 找不到聊天控制器"); return; }
+    if (!chatVC) { NSLog(@"[VoicePlugin] 无聊天控制器"); return; }
 
-    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]]];
+    NSString *outputPath = [getVoicePacksDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"send_%ld.caf", (long)[[NSDate date] timeIntervalSince1970]]];
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:sourcePath] options:nil];
     __block int duration = (int)ceil(CMTimeGetSeconds(asset.duration));
     if (duration <= 0) duration = 1;
+    NSLog(@"[VoicePlugin] 准备发送: %@, 时长: %d秒", sourcePath, duration);
 
-    convertToIMAudio(sourcePath, outputPath, ^(BOOL success) {
-        if (!success) {
-            NSLog(@"[VoicePlugin] 转码失败");
-            return;
-        }
-        NSLog(@"[VoicePlugin] 转码完成: %@ (%d秒)", outputPath, duration);
+    convertToCAF(sourcePath, outputPath, ^(BOOL success) {
+        if (!success) { NSLog(@"[VoicePlugin] 转码失败"); return; }
 
         Class v2Mgr = NSClassFromString(@"V2TIMManager");
         id manager = [v2Mgr performSelector:@selector(sharedInstance)];
@@ -303,9 +320,9 @@ static void sendVoice(NSString *sourcePath) {
             if ([fm fileExistsAtPath:tempPath]) [fm removeItemAtPath:tempPath error:nil];
             [fm copyItemAtPath:url.path toPath:tempPath error:&error];
             if (error) return;
-            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.m4a", (long)[[NSDate date] timeIntervalSince1970]];
+            NSString *destName = [NSString stringWithFormat:@"视频转语音_%ld.caf", (long)[[NSDate date] timeIntervalSince1970]];
             NSString *destPath = [getVoicePacksDirectory() stringByAppendingPathComponent:destName];
-            convertToIMAudio(tempPath, destPath, ^(BOOL success) {
+            convertToCAF(tempPath, destPath, ^(BOOL success) {
                 if (success) {
                     self.files = [NSMutableArray arrayWithArray:getAllVoiceFiles()];
                     [self.tableView reloadData];
@@ -334,7 +351,7 @@ static void sendVoice(NSString *sourcePath) {
 %hook CWTalkBackView
 
 - (void)sendRecorde:(id)sender {
-    NSLog(@"[VoicePlugin] 松手触发 sendRecorde，弹出列表");
+    NSLog(@"[VoicePlugin] 松手触发，弹出列表");
 
     VoicePackListVC *vc = [[VoicePackListVC alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
